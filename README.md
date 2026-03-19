@@ -68,6 +68,15 @@ python -m PyInstaller S2A-Manager.spec --noconfirm
 
 - `dist\S2A-Manager.exe`
 
+## 版本文件
+
+项目版本号统一保存在根目录的 `VERSION` 文件中。
+
+- 程序窗口标题读取这个版本号
+- 检查更新时会用它和 GitHub 最新 tag 做比较
+
+发布新版本时，优先修改 `VERSION`
+
 ## 环境变量
 
 程序仍兼容原有环境变量命名：

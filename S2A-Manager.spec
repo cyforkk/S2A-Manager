@@ -7,6 +7,7 @@ tk_datas = [
     (str(PYTHON_ROOT / "tcl" / "tcl8.6"), "_tcl_data"),
     (str(PYTHON_ROOT / "tcl" / "tk8.6"), "_tk_data"),
     (str(PYTHON_ROOT / "tcl" / "tcl8"), "tcl8"),
+    ("VERSION", "."),
 ]
 
 a = Analysis(
