@@ -20,6 +20,11 @@ from urllib.request import Request, urlopen
 
 
 DEFAULT_BASE_URL = os.environ.get("SUB2API_BASE_URL", "http://127.0.0.1:8080")
+APP_NAME = "S2A Manager"
+APP_VERSION = "v0.1.0"
+APP_GITHUB_REPO = "GALIAIS/S2A-Manager"
+APP_RELEASES_URL = f"https://github.com/{APP_GITHUB_REPO}/releases"
+APP_LATEST_RELEASE_API = f"https://api.github.com/repos/{APP_GITHUB_REPO}/releases/latest"
 GUI_CONFIG_DIRNAME = "S2A Manager"
 GUI_CONFIG_FILENAME = "gui-config.json"
 ENV_ADMIN_API_KEY = "SUB2API_ADMIN_API_KEY"
@@ -132,6 +137,25 @@ def normalize_api_base(url: str) -> str:
     if "/api/v1/" in value:
         return value.split("/api/v1/", 1)[0] + "/api/v1"
     return value + "/api/v1"
+
+
+def normalize_version_tag(value: str) -> tuple[int, ...]:
+    text = value.strip().lower()
+    if text.startswith("v"):
+        text = text[1:]
+    parts: list[int] = []
+    for token in re.split(r"[.\-_]", text):
+        if not token:
+            continue
+        if token.isdigit():
+            parts.append(int(token))
+            continue
+        match = re.match(r"(\d+)", token)
+        if match:
+            parts.append(int(match.group(1)))
+        else:
+            break
+    return tuple(parts or [0])
 
 
 def non_empty(value: str | None) -> str | None:
@@ -1352,7 +1376,7 @@ def run_admin_gui(
         default_admin_api_key=default_admin_api_key,
     )
     root = tk.Tk()
-    root.title("Sub2API 管理控制台")
+    root.title(f"{APP_NAME} {APP_VERSION}")
     screen_width = root.winfo_screenwidth()
     screen_height = root.winfo_screenheight()
     initial_width = min(saved_config.window_width or 1160, max(screen_width - 80, 820))
@@ -1425,6 +1449,7 @@ def run_admin_gui(
     ttk.Label(progress_frame, textvariable=progress_text_var).grid(row=0, column=1, sticky="w")
     current_cancel_event: Any = None
     stop_task_btn: Any = None
+    latest_release_notice_shown = False
 
     main_pane = ttk.PanedWindow(root, orient=tk.VERTICAL)
     main_pane.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
@@ -1682,6 +1707,104 @@ def run_admin_gui(
     def render_payload(payload: Any) -> None:
         output.delete("1.0", tk.END)
         output.insert("1.0", json.dumps(payload, ensure_ascii=False, indent=2))
+
+    def open_release_page() -> None:
+        import webbrowser
+
+        webbrowser.open(APP_RELEASES_URL)
+
+    def fetch_latest_release_info() -> dict[str, Any]:
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": DEFAULT_USER_AGENT,
+        }
+        request = Request(APP_LATEST_RELEASE_API, headers=headers, method="GET")
+        with urlopen(request, timeout=8) as response:
+            raw_body = response.read().decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(raw_body)
+        except JSONDecodeError as exc:
+            raise CLIError(f"GitHub Release 返回了非 JSON 数据: {raw_body[:200]}") from exc
+        if not isinstance(payload, dict):
+            raise CLIError("GitHub Release 返回格式异常")
+        tag_name = str(payload.get("tag_name") or "").strip()
+        html_url = str(payload.get("html_url") or APP_RELEASES_URL).strip() or APP_RELEASES_URL
+        name = str(payload.get("name") or tag_name or "未命名版本").strip()
+        body = str(payload.get("body") or "").strip()
+        published_at = str(payload.get("published_at") or "").strip()
+        return {
+            "tag_name": tag_name,
+            "html_url": html_url,
+            "name": name,
+            "body": body,
+            "published_at": published_at,
+        }
+
+    def check_for_updates(*, interactive: bool, silent_when_latest: bool = False) -> bool:
+        nonlocal latest_release_notice_shown
+        try:
+            info = fetch_latest_release_info()
+        except Exception as exc:
+            if interactive:
+                messagebox.showerror("检查更新失败", str(exc))
+            return False
+
+        latest_tag = str(info.get("tag_name") or "").strip()
+        if not latest_tag:
+            if interactive:
+                messagebox.showinfo("检查更新", "当前 GitHub Release 里还没有可识别的 tag。")
+            return False
+
+        current_version = normalize_version_tag(APP_VERSION)
+        latest_version = normalize_version_tag(latest_tag)
+        info["current_version"] = APP_VERSION
+        info["update_available"] = latest_version > current_version
+
+        if info["update_available"]:
+            status_var.set(f"发现新版本 {latest_tag}，当前版本 {APP_VERSION}")
+            body_preview = str(info.get("body") or "").strip()
+            if len(body_preview) > 300:
+                body_preview = body_preview[:300] + "..."
+            message = (
+                f"发现新版本：{latest_tag}\n"
+                f"当前版本：{APP_VERSION}\n\n"
+                f"发布标题：{info.get('name') or latest_tag}\n"
+                f"发布时间：{info.get('published_at') or '未知'}"
+            )
+            if body_preview:
+                message += f"\n\n更新说明：\n{body_preview}"
+            if interactive or not latest_release_notice_shown:
+                latest_release_notice_shown = True
+                if messagebox.askyesno("发现新版本", message + "\n\n是否打开 Release 页面？"):
+                    open_release_page()
+            return True
+
+        if interactive and not silent_when_latest:
+            messagebox.showinfo("检查更新", f"当前已是最新版本。\n当前版本：{APP_VERSION}\n最新版本：{latest_tag}")
+        return False
+
+    def trigger_update_check(*, interactive: bool, silent_when_latest: bool = False) -> None:
+        previous_status = status_var.get()
+
+        def worker() -> None:
+            safe_after(0, lambda: status_var.set("正在检查 GitHub 最新版本..."))
+            update_available = check_for_updates(interactive=interactive, silent_when_latest=silent_when_latest)
+            if not update_available:
+                safe_after(0, lambda: status_var.set(previous_status))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def show_about_dialog() -> None:
+        messagebox.showinfo(
+            "关于",
+            (
+                f"{APP_NAME}\n"
+                f"版本：{APP_VERSION}\n\n"
+                "一个面向 sub2api 管理接口的桌面管理工具。\n"
+                "支持账号同步、批量导入、批量调整、账号检测、导出和 JSON 转换。\n\n"
+                f"Release 页面：\n{APP_RELEASES_URL}"
+            ),
+        )
 
     def safe_after(delay_ms: int, callback: Callable[..., Any], *args: Any) -> str | None:
         try:
@@ -4156,11 +4279,21 @@ def run_admin_gui(
         except Exception:
             raise SystemExit(0)
 
+    menu_bar = tk.Menu(root)
+    help_menu = tk.Menu(menu_bar, tearoff=0)
+    help_menu.add_command(label="关于", command=show_about_dialog)
+    help_menu.add_command(label="检查更新", command=lambda: trigger_update_check(interactive=True))
+    help_menu.add_separator()
+    help_menu.add_command(label="打开 Release 页面", command=open_release_page)
+    menu_bar.add_cascade(label="帮助", menu=help_menu)
+    root.configure(menu=menu_bar)
+
     root.protocol("WM_DELETE_WINDOW", on_close)
     root.bind("<Configure>", ensure_initial_pane_layout, add="+")
     safe_after(80, apply_initial_pane_layout)
     safe_after(220, apply_initial_pane_layout)
     safe_after(500, apply_initial_pane_layout)
+    safe_after(1200, lambda: trigger_update_check(interactive=False, silent_when_latest=True))
 
     root.mainloop()
 
