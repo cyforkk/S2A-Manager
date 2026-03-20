@@ -2528,11 +2528,13 @@ def run_admin_gui(
         account_ids: list[int],
         *,
         progress_callback: Callable[[int, int, str], None],
+        client: AdminAPIClient | None = None,
     ) -> dict[str, Any]:
         ids = unique_ids([account_id for account_id in account_ids if isinstance(account_id, int) and account_id > 0])
         if not ids:
             return {"updated_ids": [], "failed": [], "updated_count": 0, "failed_count": 0}
 
+        request_client = client or get_client()
         updated_ids: list[int] = []
         failed: list[dict[str, Any]] = []
         batch_size = 100
@@ -2543,7 +2545,7 @@ def run_admin_gui(
             batch_ids = ids[index : index + batch_size]
             batch_no = index // batch_size + 1
             try:
-                response = get_client().request(
+                response = request_client.request(
                     "POST",
                     "/admin/accounts/bulk-update",
                     {
@@ -2589,6 +2591,8 @@ def run_admin_gui(
         *,
         progress_callback: Callable[[int, int, str], None],
         prefix: str,
+        sync_concurrency_override: int | None = None,
+        client: AdminAPIClient | None = None,
     ) -> dict[str, Any]:
         target_total = max(len(accounts_cache), 1)
 
@@ -2598,11 +2602,15 @@ def run_admin_gui(
             adjusted_current = min(target_total + max(current, 0), adjusted_total)
             progress_callback(adjusted_current, adjusted_total, f"{prefix}，正在同步最新账号状态... {message}")
 
-        return fetch_accounts(progress_callback=nested_progress)
+        return fetch_accounts(
+            progress_callback=nested_progress,
+            sync_concurrency_override=sync_concurrency_override,
+            client=client,
+        )
 
     def iter_detection_target_accounts() -> list[dict[str, Any]]:
         if not accounts_cache:
-            raise CLIError("请先点击“同步账号列表”")
+            raise CLIError("请先点击“同步账号和分组”")
         group_id = single_group_id_from_label(delete_group_var.get(), allow_all=True)
         if group_id is None:
             return [dict(account) for account in accounts_cache]
@@ -2621,8 +2629,12 @@ def run_admin_gui(
         if not target_accounts:
             raise CLIError("当前范围下没有可检测账号")
 
-        detection_concurrency = clamp_detection_concurrency(parse_optional_positive_int(detection_concurrency_var.get(), "检测并发数") or DEFAULT_DETECTION_CONCURRENCY)
+        detection_concurrency = get_configured_detection_concurrency()
         source_mode = detection_usage_source_mode_var.get().strip().lower()
+        sync_concurrency = max(get_configured_sync_concurrency(), detection_concurrency)
+        client_snapshot = build_client_snapshot()
+        get_thread_client = make_thread_local_client_getter(snapshot=client_snapshot)
+        sync_client = build_client_from_snapshot(client_snapshot)
         completed = 0
         problem_accounts: list[dict[str, Any]] = []
         failed_accounts: list[dict[str, Any]] = []
@@ -2638,8 +2650,9 @@ def run_admin_gui(
             usage_source = resolve_account_usage_source(account, source_mode)
             usage: dict[str, Any] | None = None
             usage_error: str | None = None
+            client = get_thread_client()
             try:
-                _, raw_text = get_client().request_text(
+                _, raw_text = client.request_text(
                     "POST",
                     f"/admin/accounts/{account_id}/test",
                     payload={},
@@ -2650,7 +2663,7 @@ def run_admin_gui(
                 test_result = analyze_account_test_result(error_text=str(exc))
 
             try:
-                usage_result = get_client().request("GET", build_account_usage_path(account_id, usage_source))
+                usage_result = client.request("GET", build_account_usage_path(account_id, usage_source))
                 if isinstance(usage_result, dict):
                     usage = usage_result
                 else:
@@ -2765,6 +2778,7 @@ def run_admin_gui(
                     len(target_accounts) + max(total, 1),
                     message,
                 ),
+                client=sync_client,
             )
 
         if detected_auth_error_ids or detected_quota_ids:
@@ -2778,6 +2792,8 @@ def run_admin_gui(
             synced_accounts_result = sync_account_cache_after_detection(
                 progress_callback=progress_callback,
                 prefix=sync_prefix,
+                sync_concurrency_override=sync_concurrency,
+                client=sync_client,
             )
 
         problem_accounts.sort(key=lambda item: int(item.get("id") or 0))
@@ -2801,6 +2817,7 @@ def run_admin_gui(
         return {
             "scope_account_count": len(target_accounts),
             "detection_concurrency": detection_concurrency,
+            "post_sync_concurrency": sync_concurrency,
             "usage_source_mode": source_mode or "auto",
             "detected_auth_error_count": len(invalid_401_account_ids_cache),
             "detected_quota_count": len(invalid_quota_account_ids_cache),
@@ -2819,9 +2836,11 @@ def run_admin_gui(
         if not target_accounts:
             raise CLIError("当前范围下没有可刷新的账号")
 
-        refresh_concurrency = clamp_detection_concurrency(
-            parse_optional_positive_int(detection_concurrency_var.get(), "检测并发数") or DEFAULT_DETECTION_CONCURRENCY
-        )
+        refresh_concurrency = get_configured_detection_concurrency()
+        sync_concurrency = max(get_configured_sync_concurrency(), refresh_concurrency)
+        client_snapshot = build_client_snapshot()
+        get_thread_client = make_thread_local_client_getter(snapshot=client_snapshot)
+        sync_client = build_client_from_snapshot(client_snapshot)
         completed = 0
         refreshed_count = 0
         failed_refreshes: list[dict[str, Any]] = []
@@ -2839,8 +2858,9 @@ def run_admin_gui(
                     "ok": False,
                     "message": "账号 ID 无效",
                 }
+            client = get_thread_client()
             try:
-                status, raw_text = get_client().request_text(
+                status, raw_text = client.request_text(
                     "POST",
                     f"/admin/accounts/{account_id}/test",
                     payload={},
@@ -2920,6 +2940,7 @@ def run_admin_gui(
                     len(target_accounts) + max(total, 1),
                     message,
                 ),
+                client=sync_client,
             )
 
         account_sync_progress_base = max(len(target_accounts), 1)
@@ -2933,11 +2954,16 @@ def run_admin_gui(
                 f"手动刷新状态完成，正在同步最新账号状态... {message}",
             )
 
-        accounts_result = fetch_accounts(progress_callback=sync_progress)
+        accounts_result = fetch_accounts(
+            progress_callback=sync_progress,
+            sync_concurrency_override=sync_concurrency,
+            client=sync_client,
+        )
         failed_refreshes.sort(key=lambda item: int(item.get("account_id") or 0))
         return {
             "scope_account_count": len(target_accounts),
             "refresh_concurrency": refresh_concurrency,
+            "post_sync_concurrency": sync_concurrency,
             "refreshed_count": refreshed_count,
             "detected_auth_error_count": len(unique_ids(detected_auth_error_ids)),
             "detected_quota_count": len(unique_ids(detected_quota_ids)),
@@ -2973,7 +2999,7 @@ def run_admin_gui(
             messagebox.showinfo("保存成功", f"配置已保存到：\n{path}")
         return path
 
-    def get_client(*, require_admin_key: bool = True) -> AdminAPIClient:
+    def build_client_snapshot(*, require_admin_key: bool = True) -> dict[str, Any]:
         base_url = non_empty(base_url_var.get())
         admin_key = non_empty(admin_key_var.get())
         if not base_url:
@@ -2981,15 +3007,57 @@ def run_admin_gui(
         if require_admin_key and not admin_key:
             raise CLIError("管理员 API Key 不能为空")
 
+        return {
+            "base_url": base_url,
+            "admin_api_key": admin_key,
+            "bearer_token": None,
+            "login": LoginOptions(email=None, password=None, turnstile_token=None, totp_code=None),
+            "timeout": default_timeout,
+            "insecure": default_insecure,
+            "user_agent": DEFAULT_USER_AGENT,
+        }
+
+    def build_client_from_snapshot(snapshot: dict[str, Any]) -> AdminAPIClient:
         return AdminAPIClient(
-            base_url,
-            admin_api_key=admin_key,
-            bearer_token=None,
-            login=LoginOptions(email=None, password=None, turnstile_token=None, totp_code=None),
-            timeout=default_timeout,
-            insecure=default_insecure,
-            user_agent=DEFAULT_USER_AGENT,
+            snapshot["base_url"],
+            admin_api_key=snapshot["admin_api_key"],
+            bearer_token=snapshot["bearer_token"],
+            login=snapshot["login"],
+            timeout=snapshot["timeout"],
+            insecure=snapshot["insecure"],
+            user_agent=snapshot["user_agent"],
         )
+
+    def make_thread_local_client_getter(
+        *,
+        require_admin_key: bool = True,
+        snapshot: dict[str, Any] | None = None,
+    ) -> Callable[[], AdminAPIClient]:
+        client_snapshot = dict(snapshot or build_client_snapshot(require_admin_key=require_admin_key))
+        local_state = threading.local()
+
+        def get_thread_client() -> AdminAPIClient:
+            client = getattr(local_state, "client", None)
+            if client is None:
+                client = build_client_from_snapshot(client_snapshot)
+                local_state.client = client
+            return client
+
+        return get_thread_client
+
+    def get_configured_sync_concurrency() -> int:
+        return clamp_sync_concurrency(parse_optional_positive_int(sync_concurrency_var.get(), "同步并发数") or DEFAULT_SYNC_CONCURRENCY)
+
+    def get_configured_detection_concurrency() -> int:
+        return clamp_detection_concurrency(parse_optional_positive_int(detection_concurrency_var.get(), "检测并发数") or DEFAULT_DETECTION_CONCURRENCY)
+
+    def get_configured_delete_concurrency() -> int:
+        return clamp_delete_concurrency(parse_optional_positive_int(delete_concurrency_var.get(), "删除并发数") or DEFAULT_DELETE_CONCURRENCY)
+
+    def get_client(*, require_admin_key: bool = True) -> AdminAPIClient:
+        snapshot = build_client_snapshot(require_admin_key=require_admin_key)
+
+        return build_client_from_snapshot(snapshot)
 
     def format_account_label(account: dict[str, Any]) -> str:
         account_id = int(account.get("id") or 0)
@@ -3173,10 +3241,15 @@ def run_admin_gui(
             progress_callback(1, 1, f"分组同步完成，共 {len(parsed)} 个分组")
         return {"group_count": len(parsed), "groups": parsed}
 
-    def fetch_accounts(progress_callback: Callable[[int, int, str], None] | None = None) -> dict[str, Any]:
-        sync_concurrency = clamp_sync_concurrency(parse_optional_positive_int(sync_concurrency_var.get(), "同步并发数") or DEFAULT_SYNC_CONCURRENCY)
+    def fetch_accounts(
+        progress_callback: Callable[[int, int, str], None] | None = None,
+        *,
+        sync_concurrency_override: int | None = None,
+        client: AdminAPIClient | None = None,
+    ) -> dict[str, Any]:
+        sync_concurrency = clamp_sync_concurrency(sync_concurrency_override or get_configured_sync_concurrency())
         parsed = list_all_accounts(
-            get_client(),
+            client or get_client(),
             page_size=ADMIN_LIST_PAGE_SIZE_CAP,
             concurrency=sync_concurrency,
             progress_callback=progress_callback,
@@ -3606,7 +3679,9 @@ def run_admin_gui(
         ids = unique_ids([account_id for account_id in account_ids if isinstance(account_id, int) and account_id > 0])
         if not ids:
             raise CLIError("当前没有可删除的账号")
-        delete_concurrency = clamp_delete_concurrency(parse_optional_positive_int(delete_concurrency_var.get(), "删除并发数") or DEFAULT_DELETE_CONCURRENCY)
+        delete_concurrency = get_configured_delete_concurrency()
+        client_snapshot = build_client_snapshot()
+        get_thread_client = make_thread_local_client_getter(snapshot=client_snapshot)
         completed = 0
         deleted_ids: list[int] = []
         failed: list[dict[str, Any]] = []
@@ -3615,7 +3690,7 @@ def run_admin_gui(
         def delete_one(account_id: int) -> tuple[int, bool, Any]:
             ensure_not_cancelled()
             try:
-                response = get_client().request("DELETE", f"/admin/accounts/{account_id}")
+                response = get_thread_client().request("DELETE", f"/admin/accounts/{account_id}")
                 return (account_id, True, response)
             except APIError as exc:
                 return (
