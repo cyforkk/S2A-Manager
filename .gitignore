@@ -7,3 +7,4 @@ dist/
 .idea/
 .vscode/
 release.ps1
+release/
