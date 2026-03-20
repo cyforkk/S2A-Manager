@@ -79,6 +79,7 @@ DEFAULT_SYNC_CONCURRENCY = 4
 DEFAULT_DETECTION_CONCURRENCY = 20
 DEFAULT_DELETE_CONCURRENCY = 8
 REQUEST_RETRY_LIMIT = 3
+ACCOUNT_LIST_GROUP_UNGROUPED = "ungrouped"
 CREDENTIAL_FALLBACK_KEYS = (
     "token",
     "access_token",
@@ -100,6 +101,57 @@ CREDENTIAL_FALLBACK_KEYS = (
     "endpoint",
     "base_url",
     "region",
+)
+REAUTH_TEXT_MARKERS = (
+    "401",
+    "unauth",
+    "unauthorized",
+    "unauthenticated",
+    "authentication_error",
+    "invalid token",
+    "token invalid",
+    "token invalidated",
+    "token expired",
+    "token revoked",
+    "invalid_grant",
+    "invalid_session",
+    "missing_access_token",
+    "missing access token",
+    "no access token available",
+    "access token has expired",
+    "session expired",
+    "login required",
+    "reauth",
+    "re-auth",
+    "please reauthorize",
+    "please re-auth",
+)
+FORBIDDEN_TEXT_MARKERS = (
+    "403",
+    "forbidden",
+    "permission_error",
+    "access forbidden",
+    "validation required",
+    "needs verify",
+    "need verify",
+    "account violation",
+    "lack permissions",
+    "suspended",
+    "blocked by cloudflare challenge",
+)
+QUOTA_TEXT_MARKERS = (
+    "usage_limit_reached",
+    "insufficient_quota",
+    "quota",
+    "quota_exhausted",
+    "rate limit",
+    "rate_limited",
+    "rate limited",
+    "rate_limit_exceeded",
+    "resource_exhausted",
+    "resource has been exhausted",
+    "credits exhausted",
+    "429",
 )
 
 
@@ -247,6 +299,162 @@ def save_gui_config(config: GUIConfig) -> Path:
     except OSError as exc:
         raise CLIError(f"保存本地配置失败: {path}: {exc}") from exc
     return path
+
+
+def contains_any_marker(value: str, markers: tuple[str, ...]) -> bool:
+    normalized = " ".join(str(value or "").strip().lower().split())
+    if not normalized:
+        return False
+    return any(marker in normalized for marker in markers)
+
+
+def collect_text_fragments(value: Any) -> list[str]:
+    fragments: list[str] = []
+    stack = [value]
+    while stack:
+        current = stack.pop()
+        if current is None:
+            continue
+        if isinstance(current, str):
+            text = current.strip()
+            if text:
+                fragments.append(text)
+            continue
+        if isinstance(current, dict):
+            for nested in reversed(list(current.values())):
+                stack.append(nested)
+            continue
+        if isinstance(current, list):
+            for nested in reversed(current):
+                stack.append(nested)
+    return fragments
+
+
+def summarize_text_fragments(texts: list[str], *, fallback: str = "", max_items: int = 3, max_length: int = 240) -> str:
+    unique_texts: list[str] = []
+    seen: set[str] = set()
+    for text in texts:
+        normalized = " ".join(text.split())
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_texts.append(normalized)
+        if len(unique_texts) >= max_items:
+            break
+    summary = " | ".join(unique_texts)
+    if not summary:
+        summary = " ".join(fallback.split())
+    if len(summary) > max_length:
+        summary = summary[: max_length - 3].rstrip() + "..."
+    return summary
+
+
+def iter_sse_json_events(raw_text: str) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    data_lines: list[str] = []
+
+    def flush() -> None:
+        nonlocal data_lines
+        if not data_lines:
+            return
+        payload = "\n".join(data_lines).strip()
+        data_lines = []
+        if not payload or payload == "[DONE]":
+            return
+        try:
+            parsed = json.loads(payload)
+        except JSONDecodeError:
+            return
+        if isinstance(parsed, dict):
+            events.append(parsed)
+
+    for raw_line in raw_text.splitlines():
+        line = raw_line.rstrip("\r")
+        stripped = line.strip()
+        if not stripped:
+            flush()
+            continue
+        if stripped.startswith("data:"):
+            data_lines.append(stripped[5:].strip())
+            continue
+        if stripped.startswith("event:") or stripped.startswith(":"):
+            continue
+        if stripped.startswith("{") or stripped.startswith("["):
+            data_lines.append(stripped)
+    flush()
+    return events
+
+
+def analyze_account_test_result(*, raw_text: str | None = None, error_text: str | None = None) -> dict[str, Any]:
+    events = iter_sse_json_events(raw_text or "")
+    source_texts: list[str] = []
+    error_texts: list[str] = []
+    saw_success = False
+    saw_error = False
+
+    for event in events:
+        event_type = str(event.get("type") or "").strip().lower()
+        event_texts: list[str] = []
+        for key in ("text", "message", "error", "detail", "data", "response"):
+            event_texts.extend(collect_text_fragments(event.get(key)))
+
+        if event_type == "test_complete":
+            if event.get("success") is True:
+                saw_success = True
+            else:
+                saw_error = True
+                error_texts.extend(event_texts)
+            continue
+
+        if event_type == "error":
+            saw_error = True
+            error_texts.extend(event_texts)
+            continue
+
+        if event_type in {"sora_test_result", "test_result"}:
+            status_text = str(event.get("status") or "").strip().lower()
+            if status_text in {"failed", "error"}:
+                saw_error = True
+                error_texts.extend(event_texts)
+            else:
+                source_texts.extend(event_texts)
+            continue
+
+        if any(flag in event_type for flag in ("error", "failed", "incomplete", "cancelled", "canceled")):
+            saw_error = True
+            error_texts.extend(event_texts)
+            continue
+
+        source_texts.extend(event_texts)
+
+    if raw_text:
+        normalized_raw = raw_text.lower()
+        source_texts.append(raw_text)
+        if '"type":"error"' in normalized_raw or '"type": "error"' in normalized_raw or '"success":false' in normalized_raw:
+            saw_error = True
+        if '"success":true' in normalized_raw or '"success": true' in normalized_raw:
+            saw_success = True
+
+    if error_text:
+        saw_error = True
+        error_texts.extend(collect_text_fragments(error_text))
+        source_texts.extend(collect_text_fragments(error_text))
+
+    combined_text = " | ".join([*error_texts, *source_texts]).lower()
+    summary = summarize_text_fragments([*error_texts, *source_texts], fallback=raw_text or error_text or "")
+    return {
+        "ok": saw_success and not saw_error,
+        "has_error": saw_error,
+        "has_success": saw_success,
+        "event_count": len(events),
+        "is_401": contains_any_marker(combined_text, REAUTH_TEXT_MARKERS),
+        "is_403": contains_any_marker(combined_text, FORBIDDEN_TEXT_MARKERS),
+        "is_quota": contains_any_marker(combined_text, QUOTA_TEXT_MARKERS),
+        "summary": summary,
+    }
 
 
 def configure_tk_runtime() -> None:
@@ -2125,6 +2333,14 @@ def run_admin_gui(
         )
         return text_contains_any(error_text, reauth_markers)
 
+    def usage_indicates_forbidden(usage: dict[str, Any]) -> bool:
+        if usage.get("is_forbidden") is True:
+            return True
+        error_code = str(usage.get("error_code") or "").strip().lower()
+        if error_code in {"forbidden", "permission_error"}:
+            return True
+        return text_contains_any(usage_error_text(usage), FORBIDDEN_TEXT_MARKERS)
+
     def account_error_text(account: dict[str, Any]) -> str:
         return str(account.get("error_message") or account.get("error") or "").strip().lower()
 
@@ -2153,6 +2369,9 @@ def run_admin_gui(
         if text_contains_any(error_text, reauth_markers):
             return True
         return False
+
+    def account_indicates_forbidden(account: dict[str, Any]) -> bool:
+        return text_contains_any(account_error_text(account), FORBIDDEN_TEXT_MARKERS)
 
     def account_indicates_quota_exhausted(account: dict[str, Any], *, five_hour_threshold: float, seven_day_threshold: float) -> bool:
         error_text = account_error_text(account)
@@ -2199,6 +2418,102 @@ def run_admin_gui(
             or usage_window_utilization_above_threshold(usage, seven_day_threshold, long_window_keys)
         )
 
+    def account_prefers_passive_usage(account: dict[str, Any]) -> bool:
+        platform = str(account.get("platform") or "").strip().lower()
+        account_type = str(account.get("type") or "").strip().lower()
+        return platform == "anthropic" and account_type in {"oauth", "setup-token"}
+
+    def resolve_account_usage_source(account: dict[str, Any], source_mode: str) -> str | None:
+        normalized = source_mode.strip().lower()
+        if not account_prefers_passive_usage(account):
+            return None
+        if normalized in {"passive", "被动", "被动采样"}:
+            return "passive"
+        if normalized in {"active", "主动", "主动最新", "主动查询最新"}:
+            return "active"
+        return "passive"
+
+    def build_account_usage_path(account_id: int, source: str | None) -> str:
+        if source in {"passive", "active"}:
+            return f"/admin/accounts/{account_id}/usage?source={source}"
+        return f"/admin/accounts/{account_id}/usage"
+
+    def bulk_mark_accounts_error(
+        account_ids: list[int],
+        *,
+        progress_callback: Callable[[int, int, str], None],
+    ) -> dict[str, Any]:
+        ids = unique_ids([account_id for account_id in account_ids if isinstance(account_id, int) and account_id > 0])
+        if not ids:
+            return {"updated_ids": [], "failed": [], "updated_count": 0, "failed_count": 0}
+
+        updated_ids: list[int] = []
+        failed: list[dict[str, Any]] = []
+        batch_size = 100
+        total_batches = max((len(ids) + batch_size - 1) // batch_size, 1)
+
+        for index in range(0, len(ids), batch_size):
+            ensure_not_cancelled()
+            batch_ids = ids[index : index + batch_size]
+            batch_no = index // batch_size + 1
+            try:
+                response = get_client().request(
+                    "POST",
+                    "/admin/accounts/bulk-update",
+                    {
+                        "account_ids": batch_ids,
+                        "status": "error",
+                    },
+                )
+                success_ids = response.get("success_ids") if isinstance(response, dict) else None
+                if isinstance(success_ids, list):
+                    updated_ids.extend(int(item) for item in success_ids if isinstance(item, int) and item > 0)
+                else:
+                    updated_ids.extend(batch_ids)
+                if isinstance(response, dict):
+                    for item in response.get("results") or []:
+                        if not isinstance(item, dict) or item.get("success") is True:
+                            continue
+                        failed.append(
+                            {
+                                "account_id": item.get("account_id"),
+                                "error": str(item.get("error") or "unknown error"),
+                            }
+                        )
+            except Exception as exc:
+                error_message = str(exc)
+                for account_id in batch_ids:
+                    failed.append({"account_id": account_id, "error": error_message})
+            progress_callback(
+                batch_no,
+                total_batches,
+                f"正在回写鉴权异常状态：批次 {batch_no}/{total_batches}，成功 {len(updated_ids)} 个，失败 {len(failed)} 个",
+            )
+
+        updated_ids = unique_ids(updated_ids)
+        failed.sort(key=lambda item: int(item.get("account_id") or 0))
+        return {
+            "updated_ids": updated_ids,
+            "failed": failed,
+            "updated_count": len(updated_ids),
+            "failed_count": len(failed),
+        }
+
+    def sync_account_cache_after_detection(
+        *,
+        progress_callback: Callable[[int, int, str], None],
+        prefix: str,
+    ) -> dict[str, Any]:
+        target_total = max(len(accounts_cache), 1)
+
+        def nested_progress(current: int, total: int, message: str) -> None:
+            safe_total = max(total, 1)
+            adjusted_total = target_total + safe_total
+            adjusted_current = min(target_total + max(current, 0), adjusted_total)
+            progress_callback(adjusted_current, adjusted_total, f"{prefix}，正在同步最新账号状态... {message}")
+
+        return fetch_accounts(progress_callback=nested_progress)
+
     def iter_detection_target_accounts() -> list[dict[str, Any]]:
         if not accounts_cache:
             raise CLIError("请先点击“同步账号列表”")
@@ -2221,10 +2536,11 @@ def run_admin_gui(
             raise CLIError("当前范围下没有可检测账号")
 
         detection_concurrency = clamp_detection_concurrency(parse_optional_positive_int(detection_concurrency_var.get(), "检测并发数") or DEFAULT_DETECTION_CONCURRENCY)
+        source_mode = detection_usage_source_mode_var.get().strip().lower()
         completed = 0
         problem_accounts: list[dict[str, Any]] = []
         failed_accounts: list[dict[str, Any]] = []
-        detected_401_ids: list[int] = []
+        detected_auth_error_ids: list[int] = []
         detected_quota_ids: list[int] = []
 
         def detect_one(account: dict[str, Any]) -> dict[str, Any]:
@@ -2232,10 +2548,23 @@ def run_admin_gui(
             account_id = account.get("id")
             if not isinstance(account_id, int) or account_id <= 0:
                 return {"account": account, "ok": False, "problem": False, "error": "账号 ID 无效"}
+            test_summary = ""
+            usage_source = resolve_account_usage_source(account, source_mode)
             usage: dict[str, Any] | None = None
             usage_error: str | None = None
             try:
-                usage_result = get_client().request("GET", f"/admin/accounts/{account_id}/usage")
+                _, raw_text = get_client().request_text(
+                    "POST",
+                    f"/admin/accounts/{account_id}/test",
+                    payload={},
+                )
+                test_result = analyze_account_test_result(raw_text=raw_text)
+                test_summary = str(test_result.get("summary") or "")
+            except Exception as exc:
+                test_result = analyze_account_test_result(error_text=str(exc))
+
+            try:
+                usage_result = get_client().request("GET", build_account_usage_path(account_id, usage_source))
                 if isinstance(usage_result, dict):
                     usage = usage_result
                 else:
@@ -2244,13 +2573,18 @@ def run_admin_gui(
                 usage_error = str(exc)
 
             is_401 = account_indicates_reauth(account)
+            is_403 = account_indicates_forbidden(account)
             is_quota = account_indicates_quota_exhausted(
                 account,
                 five_hour_threshold=five_hour_threshold,
                 seven_day_threshold=seven_day_threshold,
             )
+            is_401 = is_401 or bool(test_result.get("is_401"))
+            is_403 = is_403 or bool(test_result.get("is_403"))
+            is_quota = is_quota or bool(test_result.get("is_quota"))
             if isinstance(usage, dict):
                 is_401 = is_401 or usage_indicates_reauth(usage)
+                is_403 = is_403 or usage_indicates_forbidden(usage)
                 is_quota = is_quota or usage_indicates_quota_exhausted(
                     usage,
                     five_hour_threshold=five_hour_threshold,
@@ -2260,17 +2594,41 @@ def run_admin_gui(
                 lowered_error = usage_error.lower()
                 if "401" in lowered_error or "unauth" in lowered_error or "unauthorized" in lowered_error:
                     is_401 = True
+                if "403" in lowered_error or "forbidden" in lowered_error:
+                    is_403 = True
                 if "429" in lowered_error or "quota" in lowered_error or "rate limit" in lowered_error:
                     is_quota = True
-            if detect_kind == "401":
-                problem = is_401
+            is_auth_error = is_401 or is_403
+            if detect_kind == "auth":
+                problem = is_auth_error
             elif detect_kind == "quota":
                 problem = is_quota
             else:
-                problem = is_401 or is_quota
-            if usage is None and not is_401 and not is_quota:
-                return {"account": account, "ok": False, "problem": False, "error": usage_error or "usage unavailable"}
-            return {"account": account, "ok": True, "problem": problem, "is_401": is_401, "is_quota": is_quota, "usage_error": usage_error}
+                problem = is_auth_error or is_quota
+            has_observation = bool(test_result.get("has_success") or test_result.get("has_error") or isinstance(usage, dict))
+            if not problem and not has_observation:
+                return {
+                    "account": account,
+                    "ok": False,
+                    "problem": False,
+                    "error": usage_error or test_summary or "test/usage unavailable",
+                    "is_401": is_401,
+                    "is_403": is_403,
+                    "is_auth_error": is_auth_error,
+                    "is_quota": is_quota,
+                }
+            return {
+                "account": account,
+                "ok": True,
+                "problem": problem,
+                "is_401": is_401,
+                "is_403": is_403,
+                "is_auth_error": is_auth_error,
+                "is_quota": is_quota,
+                "usage_error": usage_error,
+                "usage_source": usage_source or "default",
+                "test_summary": test_summary,
+            }
 
         with ThreadPoolExecutor(max_workers=min(detection_concurrency, len(target_accounts))) as executor:
             future_map = {executor.submit(detect_one, account): account for account in target_accounts}
@@ -2292,8 +2650,8 @@ def run_admin_gui(
                         problem_accounts.append(dict(account))
                     account_id = int(account.get("id") or 0)
                     if account_id > 0:
-                        if result.get("is_401"):
-                            detected_401_ids.append(account_id)
+                        if result.get("is_auth_error"):
+                            detected_auth_error_ids.append(account_id)
                         if result.get("is_quota"):
                             detected_quota_ids.append(account_id)
                     if not result.get("ok"):
@@ -2311,8 +2669,33 @@ def run_admin_gui(
                     )
             executor.shutdown(wait=False, cancel_futures=True)
 
+        synced_auth_errors_result: dict[str, Any] | None = None
+        synced_accounts_result: dict[str, Any] | None = None
+        if detected_auth_error_ids:
+            synced_auth_errors_result = bulk_mark_accounts_error(
+                detected_auth_error_ids,
+                progress_callback=lambda current, total, message: progress_callback(
+                    len(target_accounts) + current,
+                    len(target_accounts) + max(total, 1),
+                    message,
+                ),
+            )
+
+        if detected_auth_error_ids or detected_quota_ids:
+            sync_prefix = "检测完成"
+            if detected_auth_error_ids and detected_quota_ids:
+                sync_prefix = "鉴权异常 / 无额度状态更新完成"
+            elif detected_auth_error_ids:
+                sync_prefix = "鉴权异常状态回写完成"
+            elif detected_quota_ids:
+                sync_prefix = "无额度检测完成"
+            synced_accounts_result = sync_account_cache_after_detection(
+                progress_callback=progress_callback,
+                prefix=sync_prefix,
+            )
+
         problem_accounts.sort(key=lambda item: int(item.get("id") or 0))
-        invalid_401_account_ids_cache = unique_ids(detected_401_ids)
+        invalid_401_account_ids_cache = unique_ids(detected_auth_error_ids)
         invalid_quota_account_ids_cache = unique_ids(detected_quota_ids)
         detection_label_to_account_id = {}
         labels: list[str] = []
@@ -2320,10 +2703,10 @@ def run_admin_gui(
             account_id = int(account.get("id") or 0)
             issues: list[str] = []
             if account_id in invalid_401_account_ids_cache:
-                issues.append("401")
+                issues.append("401/403")
             if account_id in invalid_quota_account_ids_cache:
                 issues.append("无额度")
-            issue_text = " / ".join(issues) if issues else ("401" if detect_kind == "401" else ("无额度" if detect_kind == "quota" else "问题"))
+            issue_text = " / ".join(issues) if issues else ("401/403" if detect_kind == "auth" else ("无额度" if detect_kind == "quota" else "问题"))
             label = format_detection_label(account, issue_text)
             labels.append(label)
             if account_id > 0:
@@ -2332,13 +2715,17 @@ def run_admin_gui(
         return {
             "scope_account_count": len(target_accounts),
             "detection_concurrency": detection_concurrency,
-            "detected_401_count": len(invalid_401_account_ids_cache),
+            "usage_source_mode": source_mode or "auto",
+            "detected_auth_error_count": len(invalid_401_account_ids_cache),
             "detected_quota_count": len(invalid_quota_account_ids_cache),
             "problem_count": len(problem_accounts),
             "problem_account_ids": [int(item.get("id") or 0) for item in problem_accounts if int(item.get("id") or 0) > 0],
             "problem_labels_preview": labels[:20],
             "failed_count": len(failed_accounts),
             "failed_preview": failed_accounts[:20],
+            "status_synced_auth_count": parse_int_field((synced_auth_errors_result or {}).get("updated_count"), 0),
+            "status_sync_failed_count": parse_int_field((synced_auth_errors_result or {}).get("failed_count"), 0),
+            "synced_account_count": parse_int_field((synced_accounts_result or {}).get("account_count"), 0),
         }
 
     def refresh_detection_account_states(progress_callback: Callable[[int, int, str], None]) -> dict[str, Any]:
@@ -2352,6 +2739,8 @@ def run_admin_gui(
         completed = 0
         refreshed_count = 0
         failed_refreshes: list[dict[str, Any]] = []
+        detected_auth_error_ids: list[int] = []
+        detected_quota_ids: list[int] = []
         progress_callback(0, len(target_accounts), f"开始手动刷新状态，共 {len(target_accounts)} 个账号，并发 {refresh_concurrency}")
 
         def refresh_one(account: dict[str, Any]) -> dict[str, Any]:
@@ -2370,26 +2759,35 @@ def run_admin_gui(
                     f"/admin/accounts/{account_id}/test",
                     payload={},
                 )
-                normalized = raw_text.lower()
-                if "event: error" in normalized or "\ndata: {\"error\"" in normalized or "\"success\":false" in normalized:
+                test_result = analyze_account_test_result(raw_text=raw_text)
+                is_auth_error = bool(test_result.get("is_401") or test_result.get("is_403"))
+                is_quota = bool(test_result.get("is_quota"))
+                if test_result.get("has_error") and not test_result.get("ok"):
                     return {
                         "account_id": account_id,
                         "name": account.get("name"),
                         "ok": False,
-                        "message": raw_text[:300].strip() or f"HTTP {status}",
+                        "message": str(test_result.get("summary") or raw_text[:300].strip() or f"HTTP {status}"),
+                        "is_auth_error": is_auth_error,
+                        "is_quota": is_quota,
                     }
                 return {
                     "account_id": account_id,
                     "name": account.get("name"),
                     "ok": True,
-                    "message": raw_text[:160].strip() or f"HTTP {status}",
+                    "message": str(test_result.get("summary") or raw_text[:160].strip() or f"HTTP {status}"),
+                    "is_auth_error": is_auth_error,
+                    "is_quota": is_quota,
                 }
             except Exception as exc:
+                test_result = analyze_account_test_result(error_text=str(exc))
                 return {
                     "account_id": account_id,
                     "name": account.get("name"),
                     "ok": False,
-                    "message": str(exc),
+                    "message": str(test_result.get("summary") or exc),
+                    "is_auth_error": bool(test_result.get("is_401") or test_result.get("is_403")),
+                    "is_quota": bool(test_result.get("is_quota")),
                 }
 
         with ThreadPoolExecutor(max_workers=min(refresh_concurrency, len(target_accounts))) as executor:
@@ -2404,6 +2802,12 @@ def run_admin_gui(
                 for future in done:
                     result = future.result()
                     completed += 1
+                    account_id = int(result.get("account_id") or 0)
+                    if account_id > 0:
+                        if result.get("is_auth_error"):
+                            detected_auth_error_ids.append(account_id)
+                        if result.get("is_quota"):
+                            detected_quota_ids.append(account_id)
                     if result.get("ok"):
                         refreshed_count += 1
                     else:
@@ -2420,6 +2824,17 @@ def run_admin_gui(
                         f"手动刷新状态：已完成 {completed}/{total} 个，成功 {refreshed_count} 个，失败 {len(failed_refreshes)} 个",
                     )
             executor.shutdown(wait=False, cancel_futures=True)
+
+        auth_status_sync_result: dict[str, Any] | None = None
+        if detected_auth_error_ids:
+            auth_status_sync_result = bulk_mark_accounts_error(
+                detected_auth_error_ids,
+                progress_callback=lambda current, total, message: progress_callback(
+                    len(target_accounts) + current,
+                    len(target_accounts) + max(total, 1),
+                    message,
+                ),
+            )
 
         account_sync_progress_base = max(len(target_accounts), 1)
 
@@ -2438,6 +2853,9 @@ def run_admin_gui(
             "scope_account_count": len(target_accounts),
             "refresh_concurrency": refresh_concurrency,
             "refreshed_count": refreshed_count,
+            "detected_auth_error_count": len(unique_ids(detected_auth_error_ids)),
+            "detected_quota_count": len(unique_ids(detected_quota_ids)),
+            "status_synced_auth_count": parse_int_field((auth_status_sync_result or {}).get("updated_count"), 0),
             "failed_refresh_count": len(failed_refreshes),
             "failed_refresh_preview": failed_refreshes[:20],
             "synced_account_count": accounts_result.get("account_count", 0),
@@ -2549,6 +2967,14 @@ def run_admin_gui(
             raise CLIError("分组下拉值无效，请先点击“同步分组”")
         return group_id
 
+    def format_group_combo_label(group: dict[str, Any]) -> str:
+        group_id = int(group.get("id") or 0)
+        name = str(group.get("name") or f"group-{group_id}")
+        platform = str(group.get("platform") or "unknown")
+        status = str(group.get("status") or "unknown")
+        visibility = "专属" if bool(group.get("is_exclusive")) else "公开"
+        return f"[{group_id}] {name} ({platform}/{status}/{visibility})"
+
     def apply_groups_to_combos(groups: list[dict[str, Any]]) -> None:
         nonlocal groups_cache, group_label_to_id
         groups_cache = groups
@@ -2556,7 +2982,7 @@ def run_admin_gui(
         labels: list[str] = []
         for group in groups:
             group_id = group["id"]
-            label = f"[{group_id}] {group['name']} ({group['platform']}/{group['status']})"
+            label = format_group_combo_label(group)
             labels.append(label)
             group_label_to_id[label] = group_id
 
@@ -2642,6 +3068,7 @@ def run_admin_gui(
                     "name": str(item.get("name") or f"group-{group_id}"),
                     "platform": str(item.get("platform") or "unknown"),
                     "status": str(item.get("status") or "unknown"),
+                    "is_exclusive": bool(item.get("is_exclusive")),
                 }
             )
         parsed.sort(key=lambda x: (x["platform"], x["name"], x["id"]))
@@ -2910,7 +3337,7 @@ def run_admin_gui(
     tab_delete_accounts.rowconfigure(8, weight=1)
     ttk.Label(
         tab_delete_accounts,
-        text="先同步账号列表，再按当前分组范围检测 401 / 无额度账号。检测会同时参考账号已有错误状态、限流状态和 /usage 数据；命中结果可直接载入待删除列表，最后统一删除。",
+        text="先同步账号列表，再按当前分组范围检测 401/403 鉴权异常和无额度账号。检测会优先执行 /test 刷新运行时状态，再按所选用量来源补充读取 /usage；Anthropic OAuth/SetupToken 默认走被动采样，命中后会同步状态并可直接载入列表。",
         style="Title.TLabel",
         justify="left",
         wraplength=980,
@@ -2919,6 +3346,7 @@ def run_admin_gui(
     delete_group_var = tk.StringVar(value=GROUP_FILTER_ALL)
     detect_five_hour_threshold_var = tk.StringVar(value="99")
     detect_seven_day_threshold_var = tk.StringVar(value="99")
+    detection_usage_source_mode_var = tk.StringVar(value="自动（Anthropic 被动，其它主动）")
     ttk.Label(tab_delete_accounts, text="当前检测分组").grid(row=1, column=0, sticky="w", pady=3)
     delete_group_combo = ttk.Combobox(tab_delete_accounts, textvariable=delete_group_var, values=[GROUP_FILTER_ALL], state="readonly")
     delete_group_combo.grid(row=1, column=1, sticky="ew", pady=3)
@@ -2948,15 +3376,28 @@ def run_admin_gui(
     ttk.Label(tab_delete_accounts, text="删除并发数").grid(row=2, column=2, sticky="w", pady=3)
     ttk.Entry(tab_delete_accounts, textvariable=delete_concurrency_var, width=10).grid(row=2, column=3, sticky="w", pady=3)
 
-    ttk.Label(tab_delete_accounts, text="5小时阈值(%)").grid(row=3, column=0, sticky="w", pady=3)
-    ttk.Entry(tab_delete_accounts, textvariable=detect_five_hour_threshold_var, width=10).grid(row=3, column=1, sticky="w", pady=3)
-    ttk.Label(tab_delete_accounts, text="7天阈值(%)").grid(row=3, column=2, sticky="w", pady=3)
-    ttk.Entry(tab_delete_accounts, textvariable=detect_seven_day_threshold_var, width=10).grid(row=3, column=3, sticky="w", pady=3)
+    detection_options_frame = ttk.Frame(tab_delete_accounts)
+    detection_options_frame.grid(row=3, column=0, columnspan=4, sticky="ew", pady=3)
+    detection_options_frame.columnconfigure(1, weight=1)
+    detection_options_frame.columnconfigure(3, weight=1)
+    detection_options_frame.columnconfigure(5, weight=1)
+    ttk.Label(detection_options_frame, text="用量来源").grid(row=0, column=0, sticky="w")
+    ttk.Combobox(
+        detection_options_frame,
+        textvariable=detection_usage_source_mode_var,
+        values=["自动（Anthropic 被动，其它主动）", "被动采样", "主动查询最新"],
+        state="readonly",
+        width=24,
+    ).grid(row=0, column=1, sticky="ew", padx=(0, 10))
+    ttk.Label(detection_options_frame, text="5小时阈值(%)").grid(row=0, column=2, sticky="w")
+    ttk.Entry(detection_options_frame, textvariable=detect_five_hour_threshold_var, width=10).grid(row=0, column=3, sticky="ew", padx=(0, 10))
+    ttk.Label(detection_options_frame, text="7天阈值(%)").grid(row=0, column=4, sticky="w")
+    ttk.Entry(detection_options_frame, textvariable=detect_seven_day_threshold_var, width=10).grid(row=0, column=5, sticky="ew")
 
     def detect_401_accounts_action(progress_callback: Callable[[int, int, str], None]) -> Any:
         return run_usage_detection(
-            title="401 检测",
-            detect_kind="401",
+            title="401/403 检测",
+            detect_kind="auth",
             progress_callback=progress_callback,
             five_hour_threshold=parse_optional_float(detect_five_hour_threshold_var.get(), "5小时阈值", min_value=0.0) or 99.0,
             seven_day_threshold=parse_optional_float(detect_seven_day_threshold_var.get(), "7天阈值", min_value=0.0) or 99.0,
@@ -3010,7 +3451,7 @@ def run_admin_gui(
                 continue
             issues: list[str] = []
             if account_id in invalid_401_account_ids_cache:
-                issues.append("401")
+                issues.append("401/403")
             if account_id in invalid_quota_account_ids_cache:
                 issues.append("无额度")
             label = format_detection_label(account, " / ".join(issues) if issues else "问题")
@@ -3104,7 +3545,7 @@ def run_admin_gui(
         )
 
     def delete_detected_401_accounts() -> None:
-        delete_account_ids_with_confirm(invalid_401_account_ids_cache, "401")
+        delete_account_ids_with_confirm(invalid_401_account_ids_cache, "401/403")
 
     def delete_detected_quota_accounts() -> None:
         delete_account_ids_with_confirm(invalid_quota_account_ids_cache, "无额度")
@@ -3115,7 +3556,7 @@ def run_admin_gui(
             "问题",
         )
 
-    detect_401_btn = ttk.Button(tab_delete_accounts, text="检测 401", command=lambda: run_action("检测 401", detect_401_accounts_action, determinate=True))
+    detect_401_btn = ttk.Button(tab_delete_accounts, text="检测 401/403", command=lambda: run_action("检测 401/403", detect_401_accounts_action, determinate=True))
     detect_401_btn.grid(row=4, column=0, sticky="w", pady=4)
     action_buttons.append(detect_401_btn)
     detect_quota_btn = ttk.Button(tab_delete_accounts, text="检测无额度", command=lambda: run_action("检测无额度", detect_quota_accounts_action, determinate=True))
@@ -3127,7 +3568,7 @@ def run_admin_gui(
     refresh_states_btn = ttk.Button(tab_delete_accounts, text="手动刷新状态", command=lambda: run_action("手动刷新状态", refresh_account_states_action, determinate=True))
     refresh_states_btn.grid(row=4, column=3, sticky="w", pady=4)
     action_buttons.append(refresh_states_btn)
-    load_401_btn = ttk.Button(tab_delete_accounts, text="载入 401 账号", command=safe_ui_action(lambda: load_detected_accounts(invalid_401_account_ids_cache, "401")))
+    load_401_btn = ttk.Button(tab_delete_accounts, text="载入 401/403 账号", command=safe_ui_action(lambda: load_detected_accounts(invalid_401_account_ids_cache, "401/403")))
     load_401_btn.grid(row=5, column=0, sticky="w", pady=4)
     action_buttons.append(load_401_btn)
     load_quota_btn = ttk.Button(tab_delete_accounts, text="载入无额度账号", command=safe_ui_action(lambda: load_detected_accounts(invalid_quota_account_ids_cache, "无额度")))
@@ -3136,7 +3577,7 @@ def run_admin_gui(
     load_all_detected_btn = ttk.Button(tab_delete_accounts, text="载入全部问题账号", command=safe_ui_action(load_all_detected_accounts))
     load_all_detected_btn.grid(row=5, column=2, sticky="w", pady=4)
     action_buttons.append(load_all_detected_btn)
-    delete_detected_401_btn = ttk.Button(tab_delete_accounts, text="直接删除 401", command=safe_ui_action(delete_detected_401_accounts))
+    delete_detected_401_btn = ttk.Button(tab_delete_accounts, text="直接删除 401/403", command=safe_ui_action(delete_detected_401_accounts))
     delete_detected_401_btn.grid(row=5, column=3, sticky="w", pady=4)
     action_buttons.append(delete_detected_401_btn)
 
@@ -4421,7 +4862,7 @@ def list_accounts_page(
     account_type: str | None,
     status: str | None,
     search: str | None,
-    group_id: int | None = None,
+    group_id: int | str | None = None,
     lite: bool = False,
 ) -> dict[str, Any]:
     effective_page_size = clamp_admin_list_page_size(page_size)
@@ -4434,8 +4875,10 @@ def list_accounts_page(
         query["status"] = status
     if search:
         query["search"] = search
-    if group_id is not None and group_id > 0:
+    if isinstance(group_id, int) and group_id > 0:
         query["group"] = group_id
+    elif isinstance(group_id, str) and group_id.strip().lower() == ACCOUNT_LIST_GROUP_UNGROUPED:
+        query["group"] = ACCOUNT_LIST_GROUP_UNGROUPED
     if lite:
         query["lite"] = "true"
 
@@ -4452,7 +4895,7 @@ def list_all_accounts(
     *,
     page_size: int = ADMIN_LIST_PAGE_SIZE_CAP,
     concurrency: int = 1,
-    group_id: int | None = None,
+    group_id: int | str | None = None,
     progress_callback: Callable[[int, int, str], None] | None = None,
     cancel_callback: Callable[[], None] | None = None,
 ) -> list[dict[str, Any]]:
@@ -4861,9 +5304,11 @@ def collect_target_account_ids(
     target_ids: list[int] = []
     effective_page_size = clamp_admin_list_page_size(getattr(args, "page_size", None))
     fetched_count = 0
-    request_group_id: int | None = None
+    request_group_id: int | str | None = None
     raw_group_ids = getattr(args, "group_ids", None)
-    if not getattr(args, "ungrouped_only", False) and raw_group_ids:
+    if getattr(args, "ungrouped_only", False):
+        request_group_id = ACCOUNT_LIST_GROUP_UNGROUPED
+    elif raw_group_ids:
         if isinstance(raw_group_ids, set) and len(raw_group_ids) == 1:
             request_group_id = next(iter(raw_group_ids))
         elif isinstance(raw_group_ids, list) and len(raw_group_ids) == 1:
