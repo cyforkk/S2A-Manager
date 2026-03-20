@@ -2082,6 +2082,79 @@ def run_admin_gui(
             ),
         )
 
+    def show_readonly_text_dialog(title: str, content: str, *, width: int = 920, height: int = 640) -> None:
+        dialog = tk.Toplevel(root)
+        dialog.title(title)
+        dialog.transient(root)
+        dialog.geometry(f"{width}x{height}")
+        dialog.minsize(720, 480)
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(0, weight=1)
+
+        container = ttk.Frame(dialog, padding=12)
+        container.grid(row=0, column=0, sticky="nsew")
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(0, weight=1)
+
+        text_widget = ScrolledText(container, wrap="none")
+        text_widget.grid(row=0, column=0, sticky="nsew")
+        text_widget.insert("1.0", content)
+        text_widget.configure(state="disabled")
+
+        action_frame = ttk.Frame(container)
+        action_frame.grid(row=1, column=0, sticky="e", pady=(10, 0))
+        ttk.Button(action_frame, text="关闭", command=dialog.destroy).grid(row=0, column=0, sticky="e")
+
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        dialog.grab_set()
+        dialog.focus_force()
+
+    def build_sub2api_accounts_template_text() -> str:
+        demo_proxy_key = build_proxy_key("http", "127.0.0.1", 7890)
+        template = {
+            "skip_default_group_bind": True,
+            "data": {
+                "type": DATA_TYPE,
+                "version": DATA_VERSION,
+                "exported_at": utc_now_rfc3339(),
+                "proxies": [
+                    {
+                        "name": "demo-proxy",
+                        "protocol": "http",
+                        "host": "127.0.0.1",
+                        "port": 7890,
+                        "username": "",
+                        "password": "",
+                        "proxy_key": demo_proxy_key,
+                        "status": "active",
+                    }
+                ],
+                "accounts": [
+                    {
+                        "name": "demo@example.com",
+                        "platform": "openai",
+                        "type": "oauth",
+                        "credentials": {
+                            "email": "demo@example.com",
+                            "access_token": "<access_token>",
+                            "refresh_token": "<refresh_token>",
+                        },
+                        "proxy_key": demo_proxy_key,
+                        "notes": "示例账号",
+                        "extra": {
+                            "source_format": "manual-template",
+                        },
+                        "concurrency": 10,
+                        "priority": 1,
+                        "rate_multiplier": 1,
+                        "expires_at": None,
+                        "auto_pause_on_expired": False,
+                    }
+                ],
+            },
+        }
+        return json.dumps(template, ensure_ascii=False, indent=2)
+
     def safe_after(delay_ms: int, callback: Callable[..., Any], *args: Any) -> str | None:
         try:
             after_id = root.after(delay_ms, callback, *args)
@@ -3398,14 +3471,28 @@ def run_admin_gui(
     detect_five_hour_threshold_var = tk.StringVar(value="99")
     detect_seven_day_threshold_var = tk.StringVar(value="99")
     detection_usage_source_mode_var = tk.StringVar(value="自动（Anthropic 被动，其它主动）")
-    ttk.Label(tab_delete_accounts, text="当前检测分组").grid(row=1, column=0, sticky="w", pady=3)
-    delete_group_combo = ttk.Combobox(tab_delete_accounts, textvariable=delete_group_var, values=[GROUP_FILTER_ALL], state="readonly")
-    delete_group_combo.grid(row=1, column=1, sticky="ew", pady=3)
+
+    def sync_detection_accounts_and_groups(progress_callback: Callable[[int, int, str], None]) -> Any:
+        progress_callback(0, 2, "开始同步账号和分组：1/2 正在同步分组...")
+        groups_result = fetch_groups()
+        progress_callback(1, 2, f"开始同步账号和分组：1/2 分组完成，共 {groups_result.get('group_count', 0)} 个；正在同步账号...")
+        accounts_result = fetch_accounts()
+        progress_callback(2, 2, f"账号和分组同步完成：分组 {groups_result.get('group_count', 0)} 个，账号 {accounts_result.get('account_count', 0)} 个")
+        return {
+            "groups": groups_result.get("group_count", 0),
+            "accounts": accounts_result.get("account_count", 0),
+        }
+
+    detection_scope_frame = ttk.Frame(tab_delete_accounts)
+    detection_scope_frame.grid(row=1, column=0, columnspan=4, sticky="w", pady=3)
+    ttk.Label(detection_scope_frame, text="当前检测分组").grid(row=0, column=0, sticky="w")
+    delete_group_combo = ttk.Combobox(tab_delete_accounts, textvariable=delete_group_var, values=[GROUP_FILTER_ALL], state="readonly", width=38)
+    delete_group_combo.grid(in_=detection_scope_frame, row=0, column=1, sticky="w", padx=(6, 8))
     group_filter_combos.append(delete_group_combo)
 
     def load_group_accounts_to_delete() -> None:
         if not accounts_cache:
-            raise CLIError("请先点击“同步账号列表”")
+            raise CLIError("请先点击“同步账号和分组”")
         group_id = single_group_id_from_label(delete_group_var.get(), allow_all=True)
         if group_id is None:
             labels = [format_account_label(account) for account in accounts_cache]
@@ -3415,23 +3502,22 @@ def run_admin_gui(
             raise CLIError("当前范围下没有账号")
         set_listbox_items(delete_accounts_listbox, labels)
 
-    delete_sync_accounts_btn = ttk.Button(tab_delete_accounts, text="同步账号列表", command=lambda: run_action("同步账号列表", fetch_accounts, determinate=True))
-    delete_sync_accounts_btn.grid(row=1, column=2, sticky="w", padx=(8, 0), pady=3)
+    delete_sync_accounts_btn = ttk.Button(tab_delete_accounts, text="同步账号和分组", command=lambda: run_action("同步账号和分组", sync_detection_accounts_and_groups, determinate=True))
+    delete_sync_accounts_btn.grid(in_=detection_scope_frame, row=0, column=2, sticky="w")
     action_buttons.append(delete_sync_accounts_btn)
     delete_group_load_btn = ttk.Button(tab_delete_accounts, text="载入当前范围账号", command=safe_ui_action(load_group_accounts_to_delete))
-    delete_group_load_btn.grid(row=1, column=3, sticky="w", padx=(8, 0), pady=3)
+    delete_group_load_btn.grid(in_=detection_scope_frame, row=0, column=3, sticky="w", padx=(8, 0))
     action_buttons.append(delete_group_load_btn)
 
-    ttk.Label(tab_delete_accounts, text="检测并发数").grid(row=2, column=0, sticky="w", pady=3)
-    ttk.Entry(tab_delete_accounts, textvariable=detection_concurrency_var, width=10).grid(row=2, column=1, sticky="w", pady=3)
-    ttk.Label(tab_delete_accounts, text="删除并发数").grid(row=2, column=2, sticky="w", pady=3)
-    ttk.Entry(tab_delete_accounts, textvariable=delete_concurrency_var, width=10).grid(row=2, column=3, sticky="w", pady=3)
+    detection_parallel_frame = ttk.Frame(tab_delete_accounts)
+    detection_parallel_frame.grid(row=2, column=0, columnspan=4, sticky="w", pady=3)
+    ttk.Label(detection_parallel_frame, text="检测并发数").grid(row=0, column=0, sticky="w")
+    ttk.Entry(detection_parallel_frame, textvariable=detection_concurrency_var, width=10).grid(row=0, column=1, sticky="w", padx=(6, 20))
+    ttk.Label(detection_parallel_frame, text="删除并发数").grid(row=0, column=2, sticky="w")
+    ttk.Entry(detection_parallel_frame, textvariable=delete_concurrency_var, width=10).grid(row=0, column=3, sticky="w", padx=(6, 0))
 
     detection_options_frame = ttk.Frame(tab_delete_accounts)
-    detection_options_frame.grid(row=3, column=0, columnspan=4, sticky="ew", pady=3)
-    detection_options_frame.columnconfigure(1, weight=1)
-    detection_options_frame.columnconfigure(3, weight=1)
-    detection_options_frame.columnconfigure(5, weight=1)
+    detection_options_frame.grid(row=3, column=0, columnspan=4, sticky="w", pady=3)
     ttk.Label(detection_options_frame, text="用量来源").grid(row=0, column=0, sticky="w")
     ttk.Combobox(
         detection_options_frame,
@@ -3439,11 +3525,11 @@ def run_admin_gui(
         values=["自动（Anthropic 被动，其它主动）", "被动采样", "主动查询最新"],
         state="readonly",
         width=24,
-    ).grid(row=0, column=1, sticky="ew", padx=(0, 10))
+    ).grid(row=0, column=1, sticky="w", padx=(6, 12))
     ttk.Label(detection_options_frame, text="5小时阈值(%)").grid(row=0, column=2, sticky="w")
-    ttk.Entry(detection_options_frame, textvariable=detect_five_hour_threshold_var, width=10).grid(row=0, column=3, sticky="ew", padx=(0, 10))
+    ttk.Entry(detection_options_frame, textvariable=detect_five_hour_threshold_var, width=10).grid(row=0, column=3, sticky="w", padx=(6, 12))
     ttk.Label(detection_options_frame, text="7天阈值(%)").grid(row=0, column=4, sticky="w")
-    ttk.Entry(detection_options_frame, textvariable=detect_seven_day_threshold_var, width=10).grid(row=0, column=5, sticky="ew")
+    ttk.Entry(detection_options_frame, textvariable=detect_seven_day_threshold_var, width=10).grid(row=0, column=5, sticky="w", padx=(6, 0))
 
     def detect_401_accounts_action(progress_callback: Callable[[int, int, str], None]) -> Any:
         return run_usage_detection(
@@ -3487,7 +3573,7 @@ def run_admin_gui(
             detection_label_to_account_id[label] = account_id
             labels.append(label)
         if not labels:
-            raise CLIError("检测结果对应的账号已失效，请重新同步账号列表后再检测")
+            raise CLIError("检测结果对应的账号已失效，请重新同步账号和分组后再检测")
         set_listbox_items(delete_accounts_listbox, labels)
 
     def load_all_detected_accounts() -> None:
@@ -3509,7 +3595,7 @@ def run_admin_gui(
             detection_label_to_account_id[label] = account_id
             labels.append(label)
         if not labels:
-            raise CLIError("检测结果对应的账号已失效，请重新同步账号列表后再检测")
+            raise CLIError("检测结果对应的账号已失效，请重新同步账号和分组后再检测")
         set_listbox_items(delete_accounts_listbox, labels)
 
     def delete_accounts_with_progress(
@@ -4184,7 +4270,7 @@ def run_admin_gui(
 
     # 转换账号 JSON
     def build_convert_accounts_tab(tab_convert_accounts: ttk.Frame) -> None:
-        tab_convert_accounts.columnconfigure(1, weight=1)
+        tab_convert_accounts.columnconfigure(0, weight=1)
         convert_mode_var = tk.StringVar(value="file")
         convert_source_var = tk.StringVar()
         convert_output_var = tk.StringVar()
@@ -4201,27 +4287,43 @@ def run_admin_gui(
             justify="left",
             wraplength=980,
         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 10))
-        ttk.Label(tab_convert_accounts, text="转换方式").grid(row=2, column=0, sticky="w")
-        ttk.Radiobutton(tab_convert_accounts, text="单个 JSON 文件", variable=convert_mode_var, value="file").grid(row=2, column=1, sticky="w")
-        ttk.Radiobutton(tab_convert_accounts, text="整个文件夹批量转换", variable=convert_mode_var, value="folder").grid(row=2, column=2, sticky="w")
+        convert_mode_row = ttk.Frame(tab_convert_accounts)
+        convert_mode_row.grid(row=2, column=0, columnspan=3, sticky="w", pady=4)
+        ttk.Label(convert_mode_row, text="转换方式").grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(convert_mode_row, text="单个 JSON 文件", variable=convert_mode_var, value="file").grid(row=0, column=1, sticky="w", padx=(8, 12))
+        ttk.Radiobutton(convert_mode_row, text="整个文件夹批量转换", variable=convert_mode_var, value="folder").grid(row=0, column=2, sticky="w")
 
-        convert_source_label = ttk.Label(tab_convert_accounts, text="待转换文件")
-        convert_source_label.grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(tab_convert_accounts, textvariable=convert_source_var).grid(row=3, column=1, sticky="ew", pady=4)
-        convert_source_btn = ttk.Button(tab_convert_accounts, text="选择文件")
-        convert_source_btn.grid(row=3, column=2, padx=(8, 0), pady=4)
-        ttk.Label(tab_convert_accounts, textvariable=convert_mode_hint_var, style="Hint.TLabel", justify="left", wraplength=980).grid(row=4, column=1, columnspan=2, sticky="w", pady=(0, 2))
+        convert_source_row = ttk.Frame(tab_convert_accounts)
+        convert_source_row.grid(row=3, column=0, columnspan=3, sticky="w", pady=4)
+        convert_source_label = ttk.Label(convert_source_row, text="待转换文件")
+        convert_source_label.grid(row=0, column=0, sticky="w")
+        ttk.Entry(convert_source_row, textvariable=convert_source_var, width=68).grid(row=0, column=1, sticky="w", padx=(8, 6))
+        convert_source_btn = ttk.Button(convert_source_row, text="选择文件")
+        convert_source_btn.grid(row=0, column=2, sticky="w")
+        ttk.Label(tab_convert_accounts, textvariable=convert_mode_hint_var, style="Hint.TLabel", justify="left", wraplength=980).grid(row=4, column=0, columnspan=3, sticky="w", pady=(0, 2))
         convert_recursive_check = ttk.Checkbutton(tab_convert_accounts, text="同时扫描子文件夹里的 JSON 文件", variable=convert_recursive_var)
-        convert_recursive_check.grid(row=5, column=1, sticky="w", pady=2)
+        convert_recursive_check.grid(row=5, column=0, columnspan=3, sticky="w", pady=2)
 
-        ttk.Label(tab_convert_accounts, text="输出文件夹").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(tab_convert_accounts, textvariable=convert_output_var).grid(row=6, column=1, sticky="ew", pady=4)
-        convert_output_btn = ttk.Button(tab_convert_accounts, text="选择文件夹", command=lambda: pick_directory(convert_output_var))
-        convert_output_btn.grid(row=6, column=2, padx=(8, 0), pady=4)
+        convert_output_row = ttk.Frame(tab_convert_accounts)
+        convert_output_row.grid(row=6, column=0, columnspan=3, sticky="w", pady=4)
+        ttk.Label(convert_output_row, text="输出文件夹").grid(row=0, column=0, sticky="w")
+        ttk.Entry(convert_output_row, textvariable=convert_output_var, width=68).grid(row=0, column=1, sticky="w", padx=(8, 6))
+        convert_output_btn = ttk.Button(convert_output_row, text="选择文件夹", command=lambda: pick_directory(convert_output_var))
+        convert_output_btn.grid(row=0, column=2, sticky="w")
         action_buttons.append(convert_output_btn)
-        ttk.Label(tab_convert_accounts, textvariable=convert_output_hint_var, style="Hint.TLabel", justify="left", wraplength=980).grid(row=7, column=1, columnspan=2, sticky="w", pady=(0, 4))
-        ttk.Label(tab_convert_accounts, text="每个输出文件包含账号数").grid(row=8, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(tab_convert_accounts, textvariable=convert_accounts_per_file_var, width=10).grid(row=8, column=1, sticky="w", pady=4)
+        ttk.Label(tab_convert_accounts, textvariable=convert_output_hint_var, style="Hint.TLabel", justify="left", wraplength=980).grid(row=7, column=0, columnspan=3, sticky="w", pady=(0, 4))
+
+        convert_count_row = ttk.Frame(tab_convert_accounts)
+        convert_count_row.grid(row=8, column=0, columnspan=3, sticky="w", pady=4)
+        ttk.Label(convert_count_row, text="每个输出文件包含账号数").grid(row=0, column=0, sticky="w")
+        ttk.Entry(convert_count_row, textvariable=convert_accounts_per_file_var, width=10).grid(row=0, column=1, sticky="w", padx=(8, 12))
+        convert_template_btn = ttk.Button(
+            convert_count_row,
+            text="查看 sub2api 模板",
+            command=lambda: show_readonly_text_dialog("sub2api 支持的账号 JSON 模板", build_sub2api_accounts_template_text()),
+        )
+        convert_template_btn.grid(row=0, column=2, sticky="w")
+        action_buttons.append(convert_template_btn)
 
         def refresh_convert_mode_ui(*_args: Any) -> None:
             mode = convert_mode_var.get().strip() or "file"
