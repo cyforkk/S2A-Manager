@@ -1481,23 +1481,19 @@ def run_admin_gui(
     stop_task_btn: Any = None
     latest_release_notice_shown = False
 
-    main_pane = ttk.PanedWindow(root, orient=tk.VERTICAL)
-    main_pane.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
-
-    notebook_container = ttk.Frame(main_pane)
+    notebook_container = ttk.Frame(root)
+    notebook_container.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 8))
     notebook_container.columnconfigure(0, weight=1)
     notebook_container.rowconfigure(0, weight=1)
     notebook = ttk.Notebook(notebook_container)
     notebook.grid(row=0, column=0, sticky="nsew")
 
-    output_frame = ttk.LabelFrame(main_pane, text="执行结果", padding=8)
+    output_frame = ttk.LabelFrame(root, text="执行结果", padding=8)
+    output_frame.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
     output_frame.columnconfigure(0, weight=1)
     output_frame.rowconfigure(0, weight=1)
-    output = ScrolledText(output_frame, wrap="word", height=8)
+    output = ScrolledText(output_frame, wrap="word", height=6)
     output.grid(row=0, column=0, sticky="nsew")
-
-    main_pane.add(notebook_container, weight=4)
-    main_pane.add(output_frame, weight=1)
 
     action_buttons: list[ttk.Button] = []
     group_filter_combos: list[Any] = []
@@ -1770,17 +1766,27 @@ def run_admin_gui(
             "published_at": published_at,
         }
 
-    def check_for_updates(*, interactive: bool, silent_when_latest: bool = False) -> bool:
-        nonlocal latest_release_notice_shown
-        try:
-            info = fetch_latest_release_info()
-        except Exception as exc:
-            if interactive:
-                messagebox.showerror("检查更新失败", str(exc))
-            return False
+    def handle_update_check_error(
+        exc: Exception,
+        *,
+        interactive: bool,
+        previous_status: str,
+    ) -> None:
+        status_var.set(previous_status)
+        if interactive:
+            messagebox.showerror("检查更新失败", str(exc))
 
+    def check_for_updates(
+        info: dict[str, Any],
+        *,
+        interactive: bool,
+        silent_when_latest: bool = False,
+        previous_status: str,
+    ) -> bool:
+        nonlocal latest_release_notice_shown
         latest_tag = str(info.get("tag_name") or "").strip()
         if not latest_tag:
+            status_var.set(previous_status)
             if interactive:
                 messagebox.showinfo("检查更新", "当前 GitHub Release 里还没有可识别的 tag。")
             return False
@@ -1809,18 +1815,37 @@ def run_admin_gui(
                     open_release_page()
             return True
 
+        status_var.set(previous_status)
         if interactive and not silent_when_latest:
             messagebox.showinfo("检查更新", f"当前已是最新版本。\n当前版本：{APP_VERSION}\n最新版本：{latest_tag}")
         return False
 
     def trigger_update_check(*, interactive: bool, silent_when_latest: bool = False) -> None:
         previous_status = status_var.get()
+        status_var.set("正在检查 GitHub 最新版本...")
 
         def worker() -> None:
-            safe_after(0, lambda: status_var.set("正在检查 GitHub 最新版本..."))
-            update_available = check_for_updates(interactive=interactive, silent_when_latest=silent_when_latest)
-            if not update_available:
-                safe_after(0, lambda: status_var.set(previous_status))
+            try:
+                info = fetch_latest_release_info()
+            except Exception as exc:
+                safe_after(
+                    0,
+                    lambda err=exc: handle_update_check_error(
+                        err,
+                        interactive=interactive,
+                        previous_status=previous_status,
+                    ),
+                )
+                return
+            safe_after(
+                0,
+                lambda payload=info: check_for_updates(
+                    payload,
+                    interactive=interactive,
+                    silent_when_latest=silent_when_latest,
+                    previous_status=previous_status,
+                ),
+            )
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2737,7 +2762,13 @@ def run_admin_gui(
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def add_tab(name: str) -> ttk.Frame:
+    def add_tab(name: str, *, scrollable: bool = True) -> ttk.Frame:
+        if not scrollable:
+            frame = ttk.Frame(notebook, padding=10)
+            frame.columnconfigure(1, weight=1)
+            notebook.add(frame, text=name)
+            return frame
+
         outer = ttk.Frame(notebook)
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(0, weight=1)
@@ -2747,14 +2778,43 @@ def run_admin_gui(
         frame = ttk.Frame(canvas, padding=10)
         frame.columnconfigure(1, weight=1)
         window_id = canvas.create_window((0, 0), window=frame, anchor="nw")
+        pending_scrollregion = False
+        pending_fit_width = False
+        last_canvas_width = 0
 
-        def update_scrollregion(_event: Any) -> None:
+        def update_scrollregion() -> None:
+            nonlocal pending_scrollregion
+            pending_scrollregion = False
+            if not canvas.winfo_exists():
+                return
             bbox = canvas.bbox("all")
             if bbox:
                 canvas.configure(scrollregion=bbox)
 
-        def fit_frame_width(event: Any) -> None:
-            canvas.itemconfigure(window_id, width=max(int(event.width), 1))
+        def schedule_scrollregion(_event: Any = None) -> None:
+            nonlocal pending_scrollregion
+            if pending_scrollregion:
+                return
+            pending_scrollregion = True
+            canvas.after_idle(update_scrollregion)
+
+        def fit_frame_width() -> None:
+            nonlocal pending_fit_width, last_canvas_width
+            pending_fit_width = False
+            if not canvas.winfo_exists():
+                return
+            width = max(int(canvas.winfo_width()), 1)
+            if width == last_canvas_width:
+                return
+            last_canvas_width = width
+            canvas.itemconfigure(window_id, width=width)
+
+        def schedule_fit_frame_width(_event: Any = None) -> None:
+            nonlocal pending_fit_width
+            if pending_fit_width:
+                return
+            pending_fit_width = True
+            canvas.after_idle(fit_frame_width)
 
         def handle_mousewheel(event: Any) -> None:
             delta = getattr(event, "delta", 0)
@@ -2762,8 +2822,8 @@ def run_admin_gui(
                 canvas.yview_scroll(int(-delta / 120), "units")
 
         canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.bind("<Configure>", fit_frame_width)
-        frame.bind("<Configure>", update_scrollregion)
+        canvas.bind("<Configure>", schedule_fit_frame_width)
+        frame.bind("<Configure>", schedule_scrollregion)
         outer.bind("<Enter>", lambda _event: canvas.bind_all("<MouseWheel>", handle_mousewheel))
         outer.bind("<Leave>", lambda _event: canvas.unbind_all("<MouseWheel>"))
 
@@ -2807,7 +2867,7 @@ def run_admin_gui(
     stop_task_btn.grid(row=4, column=0, sticky="ew", pady=(4, 0))
 
     # 开始使用
-    tab_test = add_tab("开始使用")
+    tab_test = add_tab("开始使用", scrollable=False)
     tab_test.columnconfigure(0, weight=1)
     ttk.Label(tab_test, text="第一次使用建议先完成下面三步。", style="Title.TLabel").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 4))
     ttk.Label(
@@ -2845,7 +2905,7 @@ def run_admin_gui(
     action_buttons.append(sync_btn)
 
     # 账号检测
-    tab_delete_accounts = add_tab("账号检测")
+    tab_delete_accounts = add_tab("账号检测", scrollable=False)
     tab_delete_accounts.columnconfigure(0, weight=1)
     tab_delete_accounts.rowconfigure(8, weight=1)
     ttk.Label(
@@ -3128,7 +3188,7 @@ def run_admin_gui(
     action_buttons.append(delete_accounts_btn)
 
     # 删除代理
-    tab_delete_proxies = add_tab("删除代理")
+    tab_delete_proxies = add_tab("删除代理", scrollable=False)
     tab_delete_proxies.columnconfigure(0, weight=1)
     tab_delete_proxies.rowconfigure(3, weight=1)
     ttk.Label(tab_delete_proxies, text="同步代理后，可直接下拉选择并批量删除。", style="Title.TLabel").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 4))
@@ -3192,7 +3252,7 @@ def run_admin_gui(
     action_buttons.append(delete_proxies_btn)
 
     # 批量创建账号
-    tab_batch_accounts = add_tab("批量创建账号")
+    tab_batch_accounts = add_tab("批量创建账号", scrollable=False)
     batch_accounts_file = tk.StringVar()
     add_file_row(tab_batch_accounts, 0, "账号 JSON 文件", batch_accounts_file)
     batch_accounts_btn = ttk.Button(
@@ -3210,7 +3270,7 @@ def run_admin_gui(
     action_buttons.append(batch_accounts_btn)
 
     # 批量创建代理
-    tab_batch_proxies = add_tab("批量创建代理")
+    tab_batch_proxies = add_tab("批量创建代理", scrollable=False)
     batch_proxies_file = tk.StringVar()
     add_file_row(tab_batch_proxies, 0, "代理 JSON 文件", batch_proxies_file)
     batch_proxies_btn = ttk.Button(
@@ -3867,7 +3927,7 @@ def run_admin_gui(
     action_buttons.append(convert_start_btn)
 
     # 导入代理数据
-    tab_import_proxies = add_tab("导入代理数据")
+    tab_import_proxies = add_tab("导入代理数据", scrollable=False)
     import_proxies_file = tk.StringVar()
     add_file_row(tab_import_proxies, 0, "代理导入 JSON 文件", import_proxies_file)
     import_proxies_btn = ttk.Button(
@@ -4268,27 +4328,6 @@ def run_admin_gui(
     api_btn.grid(row=6, column=0, sticky="w", pady=4)
     action_buttons.append(api_btn)
 
-    pane_layout_initialized = False
-
-    def apply_initial_pane_layout(*_args: Any) -> None:
-        nonlocal pane_layout_initialized
-        try:
-            root.update_idletasks()
-            total_height = max(main_pane.winfo_height(), root.winfo_height())
-            if total_height <= 1:
-                return
-            sash_position = max(int(total_height * 0.80), 480)
-            sash_position = min(sash_position, max(total_height - 180, 480))
-            main_pane.sashpos(0, sash_position)
-            pane_layout_initialized = True
-        except tk.TclError:
-            return
-
-    def ensure_initial_pane_layout(_event: Any = None) -> None:
-        if pane_layout_initialized:
-            return
-        apply_initial_pane_layout()
-
     def on_close() -> None:
         request_cancel_current_task()
         cancel_scheduled_afters()
@@ -4319,11 +4358,7 @@ def run_admin_gui(
     root.configure(menu=menu_bar)
 
     root.protocol("WM_DELETE_WINDOW", on_close)
-    root.bind("<Configure>", ensure_initial_pane_layout, add="+")
-    safe_after(80, apply_initial_pane_layout)
-    safe_after(220, apply_initial_pane_layout)
-    safe_after(500, apply_initial_pane_layout)
-    safe_after(1200, lambda: trigger_update_check(interactive=False, silent_when_latest=True))
+    safe_after(2500, lambda: trigger_update_check(interactive=False, silent_when_latest=True))
 
     root.mainloop()
 
