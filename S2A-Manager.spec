@@ -1,8 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
 from pathlib import Path
+import sys
 
-PYTHON_ROOT = Path(r"C:\Users\GALIAIS\.pyenv\pyenv-win\versions\3.12.10")
+PYTHON_ROOT = Path(os.environ.get("PYINSTALLER_PYTHON_ROOT") or sys.base_prefix)
+if not (PYTHON_ROOT / "tcl").exists():
+    PYTHON_ROOT = Path(sys.executable).resolve().parent
+
 tk_datas = [
     (str(PYTHON_ROOT / "tcl" / "tcl8.6"), "_tcl_data"),
     (str(PYTHON_ROOT / "tcl" / "tk8.6"), "_tk_data"),

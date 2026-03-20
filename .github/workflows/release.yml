@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的现有 tag，例如 v0.2.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Resolve Release Tag
+        id: release_ref
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            "checkout_ref=${{ inputs.tag }}" >> $env:GITHUB_OUTPUT
+            "release_tag=${{ inputs.tag }}" >> $env:GITHUB_OUTPUT
+          } else {
+            "checkout_ref=${{ github.ref }}" >> $env:GITHUB_OUTPUT
+            "release_tag=${{ github.ref_name }}" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.release_ref.outputs.checkout_ref }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Build Dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+
+      - name: Verify Tag Matches VERSION
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.release_ref.outputs.release_tag }}"
+          $version = (Get-Content VERSION -Raw).Trim()
+          if ($tag -ne $version) {
+            throw "Tag '$tag' does not match VERSION '$version'."
+          }
+
+      - name: Build EXE
+        shell: pwsh
+        run: |
+          python -m PyInstaller S2A-Manager.spec --noconfirm
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: S2A-Manager-${{ steps.release_ref.outputs.release_tag }}
+          path: dist/S2A-Manager.exe
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ steps.release_ref.outputs.release_tag }}"
+          $asset = "dist/S2A-Manager.exe"
+
+          gh release view $tag --json tagName -q .tagName *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $asset --clobber
+          } else {
+            gh release create $tag $asset --title "S2A Manager $tag" --generate-notes
+          }
