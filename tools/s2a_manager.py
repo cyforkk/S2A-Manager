@@ -79,6 +79,7 @@ DEFAULT_SYNC_CONCURRENCY = 4
 DEFAULT_DETECTION_CONCURRENCY = 20
 DEFAULT_DELETE_CONCURRENCY = 8
 REQUEST_RETRY_LIMIT = 3
+DETECTION_REQUEST_RETRY_LIMIT = 3
 ACCOUNT_LIST_GROUP_UNGROUPED = "ungrouped"
 CREDENTIAL_FALLBACK_KEYS = (
     "token",
@@ -1202,6 +1203,53 @@ def extract_error(status: int, raw_body: str) -> APIError:
 def is_transient_ssl_eof_error(exc: BaseException) -> bool:
     message = str(exc).lower()
     return "unexpected_eof_while_reading" in message or "eof occurred in violation of protocol" in message
+
+
+def is_retryable_detection_error(exc: BaseException) -> bool:
+    if isinstance(exc, TaskCancelled):
+        return False
+    if isinstance(exc, (URLError, TimeoutError, ssl.SSLError, OSError)):
+        return True
+    message = str(exc).lower()
+    retry_markers = (
+        "请求失败",
+        "timeout",
+        "timed out",
+        "temporary failure",
+        "temporarily unavailable",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "network is unreachable",
+        "remote end closed",
+        "unexpected_eof_while_reading",
+        "eof occurred in violation of protocol",
+        "ssl",
+        "10053",
+        "10054",
+        "10060",
+    )
+    return any(marker in message for marker in retry_markers)
+
+
+def retry_detection_operation(
+    operation: Callable[[], Any],
+    *,
+    attempts: int = DETECTION_REQUEST_RETRY_LIMIT,
+    delay_base: float = 0.45,
+) -> Any:
+    last_exc: BaseException | None = None
+    for attempt in range(1, max(attempts, 1) + 1):
+        try:
+            return operation()
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= attempts or not is_retryable_detection_error(exc):
+                raise
+            time.sleep(delay_base * attempt)
+    if last_exc is not None:
+        raise last_exc
+    raise CLIError("检测操作重试失败")
 
 
 def resolve_auth(args: argparse.Namespace) -> ResolvedAuth:
@@ -2655,10 +2703,12 @@ def run_admin_gui(
             usage_error: str | None = None
             client = get_thread_client()
             try:
-                _, raw_text = client.request_text(
-                    "POST",
-                    f"/admin/accounts/{account_id}/test",
-                    payload={},
+                _, raw_text = retry_detection_operation(
+                    lambda: client.request_text(
+                        "POST",
+                        f"/admin/accounts/{account_id}/test",
+                        payload={},
+                    )
                 )
                 test_result = analyze_account_test_result(raw_text=raw_text)
                 test_summary = str(test_result.get("summary") or "")
@@ -2667,7 +2717,9 @@ def run_admin_gui(
 
             if detect_quota:
                 try:
-                    usage_result = client.request("GET", build_account_usage_path(account_id, usage_source))
+                    usage_result = retry_detection_operation(
+                        lambda: client.request("GET", build_account_usage_path(account_id, usage_source))
+                    )
                     if isinstance(usage_result, dict):
                         usage = usage_result
                     else:
@@ -2785,14 +2837,16 @@ def run_admin_gui(
         account_sync_error: str | None = None
         if detected_auth_error_ids:
             try:
-                synced_auth_errors_result = bulk_mark_accounts_error(
-                    detected_auth_error_ids,
-                    progress_callback=lambda current, total, message: progress_callback(
-                        len(target_accounts) + current,
-                        len(target_accounts) + max(total, 1),
-                        message,
+                synced_auth_errors_result = retry_detection_operation(
+                    lambda: bulk_mark_accounts_error(
+                        detected_auth_error_ids,
+                        progress_callback=lambda current, total, message: progress_callback(
+                            len(target_accounts) + current,
+                            len(target_accounts) + max(total, 1),
+                            message,
+                        ),
+                        client=sync_client,
                     ),
-                    client=sync_client,
                 )
             except Exception as exc:
                 status_sync_error = str(exc)
@@ -2811,11 +2865,13 @@ def run_admin_gui(
             elif detected_quota_ids:
                 sync_prefix = "无额度检测完成"
             try:
-                synced_accounts_result = sync_account_cache_after_detection(
-                    progress_callback=progress_callback,
-                    prefix=sync_prefix,
-                    sync_concurrency_override=sync_concurrency,
-                    client=sync_client,
+                synced_accounts_result = retry_detection_operation(
+                    lambda: sync_account_cache_after_detection(
+                        progress_callback=progress_callback,
+                        prefix=sync_prefix,
+                        sync_concurrency_override=sync_concurrency,
+                        client=sync_client,
+                    )
                 )
             except Exception as exc:
                 account_sync_error = str(exc)
@@ -2847,6 +2903,7 @@ def run_admin_gui(
             "scope_account_count": len(target_accounts),
             "detection_concurrency": detection_concurrency,
             "post_sync_concurrency": sync_concurrency,
+            "request_retry_limit": DETECTION_REQUEST_RETRY_LIMIT,
             "usage_source_mode": source_mode or "auto",
             "detected_auth_error_count": len(invalid_401_account_ids_cache),
             "detected_quota_count": len(invalid_quota_account_ids_cache),
@@ -2891,10 +2948,12 @@ def run_admin_gui(
                 }
             client = get_thread_client()
             try:
-                status, raw_text = client.request_text(
-                    "POST",
-                    f"/admin/accounts/{account_id}/test",
-                    payload={},
+                status, raw_text = retry_detection_operation(
+                    lambda: client.request_text(
+                        "POST",
+                        f"/admin/accounts/{account_id}/test",
+                        payload={},
+                    )
                 )
                 test_result = analyze_account_test_result(raw_text=raw_text)
                 is_auth_error = bool(test_result.get("is_401") or test_result.get("is_403"))
@@ -2964,14 +3023,16 @@ def run_admin_gui(
 
         auth_status_sync_result: dict[str, Any] | None = None
         if detected_auth_error_ids:
-            auth_status_sync_result = bulk_mark_accounts_error(
-                detected_auth_error_ids,
-                progress_callback=lambda current, total, message: progress_callback(
-                    len(target_accounts) + current,
-                    len(target_accounts) + max(total, 1),
-                    message,
+            auth_status_sync_result = retry_detection_operation(
+                lambda: bulk_mark_accounts_error(
+                    detected_auth_error_ids,
+                    progress_callback=lambda current, total, message: progress_callback(
+                        len(target_accounts) + current,
+                        len(target_accounts) + max(total, 1),
+                        message,
+                    ),
+                    client=sync_client,
                 ),
-                client=sync_client,
             )
 
         account_sync_progress_base = max(len(target_accounts), 1)
@@ -2985,17 +3046,20 @@ def run_admin_gui(
                 f"手动刷新状态完成，正在同步最新账号状态... {message}",
             )
 
-        accounts_result = fetch_accounts(
-            progress_callback=sync_progress,
-            sync_concurrency_override=sync_concurrency,
-            client=sync_client,
-            preserve_detection_results=True,
+        accounts_result = retry_detection_operation(
+            lambda: fetch_accounts(
+                progress_callback=sync_progress,
+                sync_concurrency_override=sync_concurrency,
+                client=sync_client,
+                preserve_detection_results=True,
+            )
         )
         failed_refreshes.sort(key=lambda item: int(item.get("account_id") or 0))
         return {
             "scope_account_count": len(target_accounts),
             "refresh_concurrency": refresh_concurrency,
             "post_sync_concurrency": sync_concurrency,
+            "request_retry_limit": DETECTION_REQUEST_RETRY_LIMIT,
             "refreshed_count": refreshed_count,
             "detected_auth_error_count": len(unique_ids(detected_auth_error_ids)),
             "detected_quota_count": len(unique_ids(detected_quota_ids)),
