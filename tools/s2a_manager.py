@@ -2606,6 +2606,7 @@ def run_admin_gui(
             progress_callback=nested_progress,
             sync_concurrency_override=sync_concurrency_override,
             client=client,
+            preserve_detection_results=True,
         )
 
     def iter_detection_target_accounts() -> list[dict[str, Any]]:
@@ -2958,6 +2959,7 @@ def run_admin_gui(
             progress_callback=sync_progress,
             sync_concurrency_override=sync_concurrency,
             client=sync_client,
+            preserve_detection_results=True,
         )
         failed_refreshes.sort(key=lambda item: int(item.get("account_id") or 0))
         return {
@@ -3165,14 +3167,36 @@ def run_admin_gui(
         except NameError:
             pass
 
-    def apply_accounts_to_combos(accounts: list[dict[str, Any]]) -> None:
+    def reconcile_detection_results_with_accounts(accounts: list[dict[str, Any]]) -> None:
+        nonlocal detection_label_to_account_id, invalid_401_account_ids_cache, invalid_quota_account_ids_cache
+        available_ids = {
+            int(account.get("id") or 0)
+            for account in accounts
+            if isinstance(account.get("id"), int) and int(account.get("id") or 0) > 0
+        }
+        invalid_401_account_ids_cache = [account_id for account_id in invalid_401_account_ids_cache if account_id in available_ids]
+        invalid_quota_account_ids_cache = [account_id for account_id in invalid_quota_account_ids_cache if account_id in available_ids]
+        detection_label_to_account_id = {
+            label: account_id
+            for label, account_id in detection_label_to_account_id.items()
+            if account_id in available_ids
+        }
+
+    def clear_detection_results() -> None:
+        nonlocal detection_label_to_account_id, invalid_401_account_ids_cache, invalid_quota_account_ids_cache
+        detection_label_to_account_id = {}
+        invalid_401_account_ids_cache = []
+        invalid_quota_account_ids_cache = []
+
+    def apply_accounts_to_combos(accounts: list[dict[str, Any]], *, preserve_detection_results: bool = False) -> None:
         nonlocal accounts_cache, account_label_to_id, account_id_to_label, detection_label_to_account_id, invalid_401_account_ids_cache, invalid_quota_account_ids_cache
         accounts_cache = accounts
         account_label_to_id = {}
         account_id_to_label = {}
-        detection_label_to_account_id = {}
-        invalid_401_account_ids_cache = []
-        invalid_quota_account_ids_cache = []
+        if preserve_detection_results:
+            reconcile_detection_results_with_accounts(accounts)
+        else:
+            clear_detection_results()
         labels: list[str] = []
         for account in accounts:
             account_id = account.get("id")
@@ -3246,6 +3270,7 @@ def run_admin_gui(
         *,
         sync_concurrency_override: int | None = None,
         client: AdminAPIClient | None = None,
+        preserve_detection_results: bool = False,
     ) -> dict[str, Any]:
         sync_concurrency = clamp_sync_concurrency(sync_concurrency_override or get_configured_sync_concurrency())
         parsed = list_all_accounts(
@@ -3256,7 +3281,7 @@ def run_admin_gui(
             cancel_callback=ensure_not_cancelled,
         )
         parsed.sort(key=lambda item: (str(item.get("platform") or ""), str(item.get("name") or ""), int(item.get("id") or 0)))
-        root.after(0, lambda: apply_accounts_to_combos(parsed))
+        root.after(0, lambda: apply_accounts_to_combos(parsed, preserve_detection_results=preserve_detection_results))
         return {"account_count": len(parsed), "sync_concurrency": sync_concurrency, "accounts": parsed}
 
     def fetch_proxies(progress_callback: Callable[[int, int, str], None] | None = None) -> dict[str, Any]:
