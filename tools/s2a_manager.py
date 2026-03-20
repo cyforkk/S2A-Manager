@@ -1678,6 +1678,8 @@ def run_admin_gui(
     sync_concurrency_var = tk.StringVar(value=str(clamp_sync_concurrency(saved_config.sync_concurrency)))
     detection_concurrency_var = tk.StringVar(value=str(clamp_detection_concurrency(saved_config.detection_concurrency)))
     delete_concurrency_var = tk.StringVar(value=str(clamp_delete_concurrency(saved_config.delete_concurrency)))
+    page_size_var = tk.StringVar(value=str(saved_config.bulk_page_size))
+    batch_size_var = tk.StringVar(value=str(saved_config.bulk_batch_size))
     sync_concurrency_frame = ttk.Frame(top)
     sync_concurrency_frame.grid(row=0, column=2, columnspan=2, sticky="w", padx=(12, 0), pady=2)
     ttk.Label(sync_concurrency_frame, text="同步并发数").grid(row=0, column=0, sticky="w")
@@ -1717,6 +1719,9 @@ def run_admin_gui(
     account_picker_combos: list[Any] = []
     proxy_picker_combos: list[Any] = []
     proxy_update_combos: list[Any] = []
+    lazy_tab_builders: dict[str, Callable[[], None]] = {}
+    lazy_tab_built: set[str] = set()
+    notebook_tab_names: dict[str, str] = {}
     group_label_to_id: dict[str, int] = {}
     account_label_to_id: dict[str, int] = {}
     account_id_to_label: dict[int, str] = {}
@@ -2985,17 +2990,8 @@ def run_admin_gui(
         visibility = "专属" if bool(group.get("is_exclusive")) else "公开"
         return f"[{group_id}] {name} ({platform}/{status}/{visibility})"
 
-    def apply_groups_to_combos(groups: list[dict[str, Any]]) -> None:
-        nonlocal groups_cache, group_label_to_id
-        groups_cache = groups
-        group_label_to_id = {}
-        labels: list[str] = []
-        for group in groups:
-            group_id = group["id"]
-            label = format_group_combo_label(group)
-            labels.append(label)
-            group_label_to_id[label] = group_id
-
+    def refresh_group_combo_values() -> None:
+        labels = list(group_label_to_id.keys())
         filter_values = [GROUP_FILTER_ALL, *labels]
         update_values = [GROUP_UPDATE_KEEP, GROUP_UPDATE_CLEAR, *labels]
         for combo in group_filter_combos:
@@ -3006,6 +3002,27 @@ def run_admin_gui(
             combo.configure(values=update_values)
             if combo.get() not in update_values:
                 combo.set(GROUP_UPDATE_KEEP)
+
+    def apply_groups_to_combos(groups: list[dict[str, Any]]) -> None:
+        nonlocal groups_cache, group_label_to_id
+        groups_cache = groups
+        group_label_to_id = {}
+        for group in groups:
+            group_id = group["id"]
+            label = format_group_combo_label(group)
+            group_label_to_id[label] = group_id
+        refresh_group_combo_values()
+
+    def refresh_account_picker_combo_values() -> None:
+        values = [ACCOUNT_PICKER_HINT, *list(account_label_to_id.keys())]
+        for combo in account_picker_combos:
+            combo.configure(values=values)
+            if combo.get() not in values:
+                combo.set(ACCOUNT_PICKER_HINT)
+        try:
+            root.after(0, update_account_selection_summary)
+        except NameError:
+            pass
 
     def apply_accounts_to_combos(accounts: list[dict[str, Any]]) -> None:
         nonlocal accounts_cache, account_label_to_id, account_id_to_label, detection_label_to_account_id, invalid_401_account_ids_cache, invalid_quota_account_ids_cache
@@ -3025,15 +3042,20 @@ def run_admin_gui(
             account_label_to_id[label] = account_id
             account_id_to_label[account_id] = label
 
-        values = [ACCOUNT_PICKER_HINT, *labels]
-        for combo in account_picker_combos:
-            combo.configure(values=values)
-            if combo.get() not in values:
-                combo.set(ACCOUNT_PICKER_HINT)
-        try:
-            root.after(0, update_account_selection_summary)
-        except NameError:
-            pass
+        refresh_account_picker_combo_values()
+
+    def refresh_proxy_widget_values() -> None:
+        labels = list(proxy_label_to_id.keys())
+        picker_values = [PROXY_PICKER_HINT, *labels]
+        update_values = [PROXY_UPDATE_KEEP, PROXY_UPDATE_CLEAR, *labels]
+        for combo in proxy_picker_combos:
+            combo.configure(values=picker_values)
+            if combo.get() not in picker_values:
+                combo.set(PROXY_PICKER_HINT)
+        for combo in proxy_update_combos:
+            combo.configure(values=update_values)
+            if combo.get() not in update_values:
+                combo.set(PROXY_UPDATE_KEEP)
 
     def apply_proxies_to_widgets(proxies: list[dict[str, Any]]) -> None:
         nonlocal proxies_cache, proxy_label_to_id
@@ -3048,16 +3070,7 @@ def run_admin_gui(
             labels.append(label)
             proxy_label_to_id[label] = proxy_id
 
-        picker_values = [PROXY_PICKER_HINT, *labels]
-        update_values = [PROXY_UPDATE_KEEP, PROXY_UPDATE_CLEAR, *labels]
-        for combo in proxy_picker_combos:
-            combo.configure(values=picker_values)
-            if combo.get() not in picker_values:
-                combo.set(PROXY_PICKER_HINT)
-        for combo in proxy_update_combos:
-            combo.configure(values=update_values)
-            if combo.get() not in update_values:
-                combo.set(PROXY_UPDATE_KEEP)
+        refresh_proxy_widget_values()
 
     def fetch_groups(progress_callback: Callable[[int, int, str], None] | None = None) -> dict[str, Any]:
         if progress_callback:
@@ -3204,6 +3217,7 @@ def run_admin_gui(
             frame = ttk.Frame(notebook, padding=10)
             frame.columnconfigure(1, weight=1)
             notebook.add(frame, text=name)
+            notebook_tab_names[str(frame)] = name
             return frame
 
         outer = ttk.Frame(notebook)
@@ -3267,7 +3281,41 @@ def run_admin_gui(
         canvas.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
         notebook.add(outer, text=name)
+        notebook_tab_names[str(outer)] = name
         return frame
+
+    def ensure_lazy_tab_built(name: str) -> None:
+        if name in lazy_tab_built:
+            return
+        builder = lazy_tab_builders.get(name)
+        if builder is None:
+            return
+        builder()
+        lazy_tab_built.add(name)
+
+    def register_lazy_tab(
+        name: str,
+        builder: Callable[[ttk.Frame], None],
+        *,
+        scrollable: bool = True,
+        eager: bool = False,
+    ) -> ttk.Frame:
+        frame = add_tab(name, scrollable=scrollable)
+        lazy_tab_builders[name] = lambda: builder(frame)
+        if eager:
+            ensure_lazy_tab_built(name)
+        return frame
+
+    def build_selected_lazy_tab(_event: Any = None) -> None:
+        selected_tab = notebook.select()
+        if not selected_tab:
+            return
+        tab_name = notebook_tab_names.get(str(selected_tab))
+        if not tab_name:
+            return
+        safe_after(0, lambda name=tab_name: ensure_lazy_tab_built(name))
+
+    notebook.bind("<<NotebookTabChanged>>", build_selected_lazy_tab, add="+")
 
     def add_file_row(frame: ttk.Frame, row: int, label: str, var: tk.StringVar) -> None:
         ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
@@ -3732,643 +3780,651 @@ def run_admin_gui(
     action_buttons.append(batch_proxies_btn)
 
     # 导出现有账号
-    tab_export_accounts = add_tab("导出现有账号")
-    tab_export_accounts.columnconfigure(1, weight=1)
-    export_group_var = tk.StringVar(value=GROUP_FILTER_ALL)
-    export_platform_var = tk.StringVar(value="(不限)")
-    export_account_type_var = tk.StringVar(value="(不限)")
-    export_account_status_var = tk.StringVar(value="(不限)")
-    export_search_var = tk.StringVar()
-    export_include_proxies_var = tk.BooleanVar(value=True)
-    export_accounts_per_file_var = tk.StringVar(value="1")
-    export_output_dir_var = tk.StringVar(value=str(get_default_download_output_dir("s2a-manager-account-exports")))
-    export_output_hint_var = tk.StringVar()
+    def build_export_accounts_tab(tab_export_accounts: ttk.Frame) -> None:
+        tab_export_accounts.columnconfigure(1, weight=1)
+        export_group_var = tk.StringVar(value=GROUP_FILTER_ALL)
+        export_platform_var = tk.StringVar(value="(不限)")
+        export_account_type_var = tk.StringVar(value="(不限)")
+        export_account_status_var = tk.StringVar(value="(不限)")
+        export_search_var = tk.StringVar()
+        export_include_proxies_var = tk.BooleanVar(value=True)
+        export_accounts_per_file_var = tk.StringVar(value="1")
+        export_output_dir_var = tk.StringVar(value=str(get_default_download_output_dir("s2a-manager-account-exports")))
+        export_output_hint_var = tk.StringVar()
 
-    ttk.Label(tab_export_accounts, text="把网站现有账号下载到本地，并按你指定的数量自动拆成多个 JSON 文件。", style="Title.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
-    ttk.Label(
-        tab_export_accounts,
-        text="每个文件填 1 时，会按账号名输出一个文件一个账号；填 20 时，就会每 20 个账号打成一个 JSON，最后一个文件自动放剩余账号。分组选“不限”时，会把未分组账号一并包含进去。",
-        style="Hint.TLabel",
-        justify="left",
-        wraplength=980,
-    ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 10))
+        ttk.Label(tab_export_accounts, text="把网站现有账号下载到本地，并按你指定的数量自动拆成多个 JSON 文件。", style="Title.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        ttk.Label(
+            tab_export_accounts,
+            text="每个文件填 1 时，会按账号名输出一个文件一个账号；填 20 时，就会每 20 个账号打成一个 JSON，最后一个文件自动放剩余账号。分组选“不限”时，会把未分组账号一并包含进去。",
+            style="Hint.TLabel",
+            justify="left",
+            wraplength=980,
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 10))
 
-    ttk.Label(tab_export_accounts, text="按分组").grid(row=2, column=0, sticky="w", pady=3)
-    export_group_combo = ttk.Combobox(tab_export_accounts, textvariable=export_group_var, values=[GROUP_FILTER_ALL], state="readonly")
-    export_group_combo.grid(row=2, column=1, sticky="ew", pady=3)
-    group_filter_combos.append(export_group_combo)
-    export_sync_groups_btn = ttk.Button(tab_export_accounts, text="同步分组选项", command=lambda: run_action("同步分组", fetch_groups, determinate=True))
-    export_sync_groups_btn.grid(row=2, column=2, sticky="w", padx=(8, 0), pady=3)
-    action_buttons.append(export_sync_groups_btn)
+        ttk.Label(tab_export_accounts, text="按分组").grid(row=2, column=0, sticky="w", pady=3)
+        export_group_combo = ttk.Combobox(tab_export_accounts, textvariable=export_group_var, values=[GROUP_FILTER_ALL], state="readonly")
+        export_group_combo.grid(row=2, column=1, sticky="ew", pady=3)
+        group_filter_combos.append(export_group_combo)
+        if group_label_to_id:
+            refresh_group_combo_values()
+        export_sync_groups_btn = ttk.Button(tab_export_accounts, text="同步分组选项", command=lambda: run_action("同步分组", fetch_groups, determinate=True))
+        export_sync_groups_btn.grid(row=2, column=2, sticky="w", padx=(8, 0), pady=3)
+        action_buttons.append(export_sync_groups_btn)
 
-    export_row3 = ttk.Frame(tab_export_accounts)
-    export_row3.grid(row=3, column=0, columnspan=3, sticky="ew", pady=3)
-    export_row3.columnconfigure(1, weight=1)
-    export_row3.columnconfigure(3, weight=1)
-    ttk.Label(export_row3, text="平台").grid(row=0, column=0, sticky="w")
-    ttk.Combobox(export_row3, textvariable=export_platform_var, values=["(不限)", "openai", "anthropic", "gemini", "antigravity", "sora"], state="readonly").grid(row=0, column=1, sticky="ew", padx=(0, 10))
-    ttk.Label(export_row3, text="账号类型").grid(row=0, column=2, sticky="w")
-    export_type_combo = ttk.Combobox(export_row3, textvariable=export_account_type_var, values=["(不限)", "oauth", "apikey", "setup-token", "upstream", "bedrock"], state="readonly")
-    export_type_combo.grid(row=0, column=3, sticky="ew")
+        export_row3 = ttk.Frame(tab_export_accounts)
+        export_row3.grid(row=3, column=0, columnspan=3, sticky="ew", pady=3)
+        export_row3.columnconfigure(1, weight=1)
+        export_row3.columnconfigure(3, weight=1)
+        ttk.Label(export_row3, text="平台").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(export_row3, textvariable=export_platform_var, values=["(不限)", "openai", "anthropic", "gemini", "antigravity", "sora"], state="readonly").grid(row=0, column=1, sticky="ew", padx=(0, 10))
+        ttk.Label(export_row3, text="账号类型").grid(row=0, column=2, sticky="w")
+        export_type_combo = ttk.Combobox(export_row3, textvariable=export_account_type_var, values=["(不限)", "oauth", "apikey", "setup-token", "upstream", "bedrock"], state="readonly")
+        export_type_combo.grid(row=0, column=3, sticky="ew")
 
-    export_row4 = ttk.Frame(tab_export_accounts)
-    export_row4.grid(row=4, column=0, columnspan=3, sticky="ew", pady=3)
-    export_row4.columnconfigure(1, weight=1)
-    export_row4.columnconfigure(3, weight=1)
-    ttk.Label(export_row4, text="账号状态").grid(row=0, column=0, sticky="w")
-    ttk.Combobox(export_row4, textvariable=export_account_status_var, values=["(不限)", "active", "inactive", "error"], state="readonly").grid(row=0, column=1, sticky="ew", padx=(0, 10))
-    ttk.Label(export_row4, text="搜索关键词").grid(row=0, column=2, sticky="w")
-    ttk.Entry(export_row4, textvariable=export_search_var).grid(row=0, column=3, sticky="ew")
+        export_row4 = ttk.Frame(tab_export_accounts)
+        export_row4.grid(row=4, column=0, columnspan=3, sticky="ew", pady=3)
+        export_row4.columnconfigure(1, weight=1)
+        export_row4.columnconfigure(3, weight=1)
+        ttk.Label(export_row4, text="账号状态").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(export_row4, textvariable=export_account_status_var, values=["(不限)", "active", "inactive", "error"], state="readonly").grid(row=0, column=1, sticky="ew", padx=(0, 10))
+        ttk.Label(export_row4, text="搜索关键词").grid(row=0, column=2, sticky="w")
+        ttk.Entry(export_row4, textvariable=export_search_var).grid(row=0, column=3, sticky="ew")
 
-    export_row5 = ttk.Frame(tab_export_accounts)
-    export_row5.grid(row=5, column=0, columnspan=3, sticky="ew", pady=3)
-    export_row5.columnconfigure(1, weight=1)
-    ttk.Label(export_row5, text="输出文件夹").grid(row=0, column=0, sticky="w")
-    ttk.Entry(export_row5, textvariable=export_output_dir_var).grid(row=0, column=1, sticky="ew", padx=(0, 8))
-    export_output_btn = ttk.Button(export_row5, text="选择文件夹", command=lambda: pick_directory(export_output_dir_var))
-    export_output_btn.grid(row=0, column=2, sticky="w")
-    action_buttons.append(export_output_btn)
+        export_row5 = ttk.Frame(tab_export_accounts)
+        export_row5.grid(row=5, column=0, columnspan=3, sticky="ew", pady=3)
+        export_row5.columnconfigure(1, weight=1)
+        ttk.Label(export_row5, text="输出文件夹").grid(row=0, column=0, sticky="w")
+        ttk.Entry(export_row5, textvariable=export_output_dir_var).grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        export_output_btn = ttk.Button(export_row5, text="选择文件夹", command=lambda: pick_directory(export_output_dir_var))
+        export_output_btn.grid(row=0, column=2, sticky="w")
+        action_buttons.append(export_output_btn)
 
-    export_row6 = ttk.Frame(tab_export_accounts)
-    export_row6.grid(row=6, column=0, columnspan=3, sticky="ew", pady=3)
-    ttk.Label(export_row6, text="每个文件包含账号数").grid(row=0, column=0, sticky="w")
-    ttk.Entry(export_row6, textvariable=export_accounts_per_file_var, width=10).grid(row=0, column=1, sticky="w", padx=(8, 16))
-    ttk.Checkbutton(export_row6, text="导出账号关联代理", variable=export_include_proxies_var).grid(row=0, column=2, sticky="w")
-    ttk.Label(tab_export_accounts, textvariable=export_output_hint_var, style="Hint.TLabel", justify="left", wraplength=980).grid(row=7, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        export_row6 = ttk.Frame(tab_export_accounts)
+        export_row6.grid(row=6, column=0, columnspan=3, sticky="ew", pady=3)
+        ttk.Label(export_row6, text="每个文件包含账号数").grid(row=0, column=0, sticky="w")
+        ttk.Entry(export_row6, textvariable=export_accounts_per_file_var, width=10).grid(row=0, column=1, sticky="w", padx=(8, 16))
+        ttk.Checkbutton(export_row6, text="导出账号关联代理", variable=export_include_proxies_var).grid(row=0, column=2, sticky="w")
+        ttk.Label(tab_export_accounts, textvariable=export_output_hint_var, style="Hint.TLabel", justify="left", wraplength=980).grid(row=7, column=0, columnspan=3, sticky="w", pady=(0, 4))
 
-    def refresh_export_output_hint(*_args: Any) -> None:
-        output_dir = non_empty(export_output_dir_var.get())
-        if output_dir:
-            export_output_hint_var.set(f"文件会写到：{output_dir}")
-        else:
-            export_output_hint_var.set(f"未填写时默认写到：{get_default_download_output_dir('s2a-manager-account-exports')}")
+        def refresh_export_output_hint(*_args: Any) -> None:
+            output_dir = non_empty(export_output_dir_var.get())
+            if output_dir:
+                export_output_hint_var.set(f"文件会写到：{output_dir}")
+            else:
+                export_output_hint_var.set(f"未填写时默认写到：{get_default_download_output_dir('s2a-manager-account-exports')}")
 
-    export_output_dir_var.trace_add("write", refresh_export_output_hint)
-    refresh_export_output_hint()
+        export_output_dir_var.trace_add("write", refresh_export_output_hint)
+        refresh_export_output_hint()
 
-    def normalize_export_select(value: str) -> str | None:
-        stripped = value.strip()
-        if not stripped or stripped.startswith("("):
-            return None
-        return stripped
+        def normalize_export_select(value: str) -> str | None:
+            stripped = value.strip()
+            if not stripped or stripped.startswith("("):
+                return None
+            return stripped
 
-    def resolve_export_output_dir() -> Path:
-        output_dir = non_empty(export_output_dir_var.get())
-        if output_dir:
-            return Path(output_dir)
-        return get_default_download_output_dir("s2a-manager-account-exports")
+        def resolve_export_output_dir() -> Path:
+            output_dir = non_empty(export_output_dir_var.get())
+            if output_dir:
+                return Path(output_dir)
+            return get_default_download_output_dir("s2a-manager-account-exports")
 
-    def build_export_selection(progress_callback: Callable[[int, int, str], None]) -> dict[str, Any]:
-        platform = normalize_export_select(export_platform_var.get())
-        account_type = normalize_export_select(export_account_type_var.get())
-        account_status = normalize_export_select(export_account_status_var.get())
-        search = non_empty(export_search_var.get())
-        group_id = single_group_id_from_label(export_group_var.get(), allow_all=True)
-        include_ungrouped = group_id is None
+        def build_export_selection(progress_callback: Callable[[int, int, str], None]) -> dict[str, Any]:
+            platform = normalize_export_select(export_platform_var.get())
+            account_type = normalize_export_select(export_account_type_var.get())
+            account_status = normalize_export_select(export_account_status_var.get())
+            search = non_empty(export_search_var.get())
+            group_id = single_group_id_from_label(export_group_var.get(), allow_all=True)
+            include_ungrouped = group_id is None
 
-        progress_callback(0, 1, "正在扫描符合条件的账号...")
-        selection_args = argparse.Namespace(
-            account_ids=None,
-            platform=platform,
-            account_type=account_type,
-            account_status=account_status,
-            search=search,
-            name_contains=None,
-            group_ids=[group_id] if group_id is not None else None,
-            ungrouped_only=False,
-            max_accounts=None,
-            page_size=ADMIN_LIST_PAGE_SIZE_CAP,
-        )
-        ids = collect_target_account_ids(get_client(), selection_args, progress_callback=progress_callback)
-        if not ids:
-            raise CLIError("当前筛选条件下没有匹配到任何账号")
+            progress_callback(0, 1, "正在扫描符合条件的账号...")
+            selection_args = argparse.Namespace(
+                account_ids=None,
+                platform=platform,
+                account_type=account_type,
+                account_status=account_status,
+                search=search,
+                name_contains=None,
+                group_ids=[group_id] if group_id is not None else None,
+                ungrouped_only=False,
+                max_accounts=None,
+                page_size=ADMIN_LIST_PAGE_SIZE_CAP,
+            )
+            ids = collect_target_account_ids(get_client(), selection_args, progress_callback=progress_callback)
+            if not ids:
+                raise CLIError("当前筛选条件下没有匹配到任何账号")
 
-        return {
-            "ids": ids,
-            "matched_id_count": len(ids),
-            "group_id": group_id,
-            "group_scope": "all_including_ungrouped" if include_ungrouped else "single_group_only",
-            "include_ungrouped": include_ungrouped,
-            "path_mode": "ids_export",
-            "platform": platform,
-            "account_type": account_type,
-            "account_status": account_status,
-            "search": search,
-        }
-
-    def build_export_reimport_warnings(payload: dict[str, Any]) -> list[str]:
-        warnings: list[str] = []
-        unsupported_types: dict[str, int] = {}
-        for account in payload.get("accounts") or []:
-            if not isinstance(account, dict):
-                continue
-            account_type = str(account.get("type") or "").strip().lower()
-            if account_type and account_type not in VALID_ACCOUNT_IMPORT_TYPES:
-                unsupported_types[account_type] = unsupported_types.get(account_type, 0) + 1
-        for account_type, count in sorted(unsupported_types.items()):
-            warnings.append(f"检测到 {count} 个 `{account_type}` 账号；当前 /admin/accounts/data 导入接口不一定支持这种类型重新导入")
-        return warnings
-
-    def preview_export_accounts_action(progress_callback: Callable[[int, int, str], None]) -> Any:
-        selection = build_export_selection(progress_callback)
-        accounts_per_file = parse_optional_positive_int(export_accounts_per_file_var.get(), "每个文件包含账号数") or 1
-        payload = fetch_accounts_export_data(
-            get_client(),
-            ids=selection["ids"],
-            platform=selection["platform"],
-            account_type=selection["account_type"],
-            status=selection["account_status"],
-            search=selection["search"],
-            include_proxies=bool(export_include_proxies_var.get()),
-            progress_callback=progress_callback,
-        )
-        file_plans = build_accounts_export_file_plans(payload, accounts_per_file=accounts_per_file)
-        preview_files = [
-            {
-                "file_name": f"{plan['name_base']}.json",
-                "account_count": plan["account_count"],
-                "proxy_count": plan["proxy_count"],
-                "account_names": plan["account_names"][:5],
+            return {
+                "ids": ids,
+                "matched_id_count": len(ids),
+                "group_id": group_id,
+                "group_scope": "all_including_ungrouped" if include_ungrouped else "single_group_only",
+                "include_ungrouped": include_ungrouped,
+                "path_mode": "ids_export",
+                "platform": platform,
+                "account_type": account_type,
+                "account_status": account_status,
+                "search": search,
             }
-            for plan in file_plans[:10]
-        ]
-        return {
-            "output_dir": str(resolve_export_output_dir()),
-            "accounts_per_file": accounts_per_file,
-            "include_proxies": bool(export_include_proxies_var.get()),
-            "matched_account_ids": selection["matched_id_count"],
-            "matched_accounts": len(payload.get("accounts") or []),
-            "matched_proxies": len(payload.get("proxies") or []),
-            "planned_files": len(file_plans),
-            "filters": selection,
-            "warnings": build_export_reimport_warnings(payload),
-            "preview_files": preview_files,
-            "first_file_preview": file_plans[0]["payload"] if file_plans else None,
-        }
 
-    def export_accounts_to_local_action(progress_callback: Callable[[int, int, str], None]) -> Any:
-        selection = build_export_selection(progress_callback)
-        accounts_per_file = parse_optional_positive_int(export_accounts_per_file_var.get(), "每个文件包含账号数") or 1
-        output_dir = resolve_export_output_dir()
-        payload = fetch_accounts_export_data(
-            get_client(),
-            ids=selection["ids"],
-            platform=selection["platform"],
-            account_type=selection["account_type"],
-            status=selection["account_status"],
-            search=selection["search"],
-            include_proxies=bool(export_include_proxies_var.get()),
-            progress_callback=progress_callback,
+        def build_export_reimport_warnings(payload: dict[str, Any]) -> list[str]:
+            warnings: list[str] = []
+            unsupported_types: dict[str, int] = {}
+            for account in payload.get("accounts") or []:
+                if not isinstance(account, dict):
+                    continue
+                account_type = str(account.get("type") or "").strip().lower()
+                if account_type and account_type not in VALID_ACCOUNT_IMPORT_TYPES:
+                    unsupported_types[account_type] = unsupported_types.get(account_type, 0) + 1
+            for account_type, count in sorted(unsupported_types.items()):
+                warnings.append(f"检测到 {count} 个 `{account_type}` 账号；当前 /admin/accounts/data 导入接口不一定支持这种类型重新导入")
+            return warnings
+
+        def preview_export_accounts_action(progress_callback: Callable[[int, int, str], None]) -> Any:
+            selection = build_export_selection(progress_callback)
+            accounts_per_file = parse_optional_positive_int(export_accounts_per_file_var.get(), "每个文件包含账号数") or 1
+            payload = fetch_accounts_export_data(
+                get_client(),
+                ids=selection["ids"],
+                platform=selection["platform"],
+                account_type=selection["account_type"],
+                status=selection["account_status"],
+                search=selection["search"],
+                include_proxies=bool(export_include_proxies_var.get()),
+                progress_callback=progress_callback,
+            )
+            file_plans = build_accounts_export_file_plans(payload, accounts_per_file=accounts_per_file)
+            preview_files = [
+                {
+                    "file_name": f"{plan['name_base']}.json",
+                    "account_count": plan["account_count"],
+                    "proxy_count": plan["proxy_count"],
+                    "account_names": plan["account_names"][:5],
+                }
+                for plan in file_plans[:10]
+            ]
+            return {
+                "output_dir": str(resolve_export_output_dir()),
+                "accounts_per_file": accounts_per_file,
+                "include_proxies": bool(export_include_proxies_var.get()),
+                "matched_account_ids": selection["matched_id_count"],
+                "matched_accounts": len(payload.get("accounts") or []),
+                "matched_proxies": len(payload.get("proxies") or []),
+                "planned_files": len(file_plans),
+                "filters": selection,
+                "warnings": build_export_reimport_warnings(payload),
+                "preview_files": preview_files,
+                "first_file_preview": file_plans[0]["payload"] if file_plans else None,
+            }
+
+        def export_accounts_to_local_action(progress_callback: Callable[[int, int, str], None]) -> Any:
+            selection = build_export_selection(progress_callback)
+            accounts_per_file = parse_optional_positive_int(export_accounts_per_file_var.get(), "每个文件包含账号数") or 1
+            output_dir = resolve_export_output_dir()
+            payload = fetch_accounts_export_data(
+                get_client(),
+                ids=selection["ids"],
+                platform=selection["platform"],
+                account_type=selection["account_type"],
+                status=selection["account_status"],
+                search=selection["search"],
+                include_proxies=bool(export_include_proxies_var.get()),
+                progress_callback=progress_callback,
+            )
+            file_plans = build_accounts_export_file_plans(payload, accounts_per_file=accounts_per_file)
+            written_files = write_accounts_export_files(file_plans, output_dir=output_dir, progress_callback=progress_callback)
+            return {
+                "output_dir": str(output_dir),
+                "accounts_per_file": accounts_per_file,
+                "include_proxies": bool(export_include_proxies_var.get()),
+                "matched_account_ids": selection["matched_id_count"],
+                "matched_accounts": len(payload.get("accounts") or []),
+                "matched_proxies": len(payload.get("proxies") or []),
+                "written_files": len(written_files),
+                "warnings": build_export_reimport_warnings(payload),
+                "files": written_files,
+            }
+
+        export_preview_btn = ttk.Button(
+            tab_export_accounts,
+            text="预估导出结果",
+            command=lambda: run_action("预估导出结果", preview_export_accounts_action, determinate=True),
         )
-        file_plans = build_accounts_export_file_plans(payload, accounts_per_file=accounts_per_file)
-        written_files = write_accounts_export_files(file_plans, output_dir=output_dir, progress_callback=progress_callback)
-        return {
-            "output_dir": str(output_dir),
-            "accounts_per_file": accounts_per_file,
-            "include_proxies": bool(export_include_proxies_var.get()),
-            "matched_account_ids": selection["matched_id_count"],
-            "matched_accounts": len(payload.get("accounts") or []),
-            "matched_proxies": len(payload.get("proxies") or []),
-            "written_files": len(written_files),
-            "warnings": build_export_reimport_warnings(payload),
-            "files": written_files,
-        }
+        export_preview_btn.grid(row=8, column=0, sticky="w", pady=6)
+        action_buttons.append(export_preview_btn)
+        export_start_btn = ttk.Button(
+            tab_export_accounts,
+            text="开始下载到本地",
+            command=lambda: run_action("下载账号到本地", export_accounts_to_local_action, determinate=True),
+        )
+        export_start_btn.grid(row=8, column=1, sticky="w", pady=6)
+        action_buttons.append(export_start_btn)
 
-    export_preview_btn = ttk.Button(
-        tab_export_accounts,
-        text="预估导出结果",
-        command=lambda: run_action("预估导出结果", preview_export_accounts_action, determinate=True),
-    )
-    export_preview_btn.grid(row=8, column=0, sticky="w", pady=6)
-    action_buttons.append(export_preview_btn)
-    export_start_btn = ttk.Button(
-        tab_export_accounts,
-        text="开始下载到本地",
-        command=lambda: run_action("下载账号到本地", export_accounts_to_local_action, determinate=True),
-    )
-    export_start_btn.grid(row=8, column=1, sticky="w", pady=6)
-    action_buttons.append(export_start_btn)
+    tab_export_accounts = register_lazy_tab("导出现有账号", build_export_accounts_tab)
 
     # 导入账号数据
-    tab_import_accounts = add_tab("导入账号数据")
-    tab_import_accounts.columnconfigure(1, weight=1)
-    import_mode_var = tk.StringVar(value="file")
-    import_source_var = tk.StringVar()
-    import_mode_hint_var = tk.StringVar()
-    import_recursive_var = tk.BooleanVar(value=True)
-    skip_default_group_bind_var = tk.BooleanVar(value=True)
-    ttk.Label(tab_import_accounts, text="把导出的账号 JSON 导入到当前网站。", style="Title.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
-    ttk.Label(
-        tab_import_accounts,
-        text="先选择导入方式，再选择一个文件或一个文件夹即可。建议先点“先检查文件格式”；如果检查不通过，再去旁边的“转换账号 JSON”页处理。",
-        style="Hint.TLabel",
-        justify="left",
-        wraplength=980,
-    ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 10))
-    ttk.Label(tab_import_accounts, text="导入方式").grid(row=2, column=0, sticky="w")
-    ttk.Radiobutton(tab_import_accounts, text="单个 JSON 文件", variable=import_mode_var, value="file").grid(row=2, column=1, sticky="w")
-    ttk.Radiobutton(tab_import_accounts, text="整个文件夹批量导入", variable=import_mode_var, value="folder").grid(row=2, column=2, sticky="w")
-    import_source_label = ttk.Label(tab_import_accounts, text="导入来源文件")
-    import_source_label.grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
-    ttk.Entry(tab_import_accounts, textvariable=import_source_var).grid(row=3, column=1, sticky="ew", pady=4)
-    import_source_btn = ttk.Button(tab_import_accounts, text="选择文件")
-    import_source_btn.grid(row=3, column=2, padx=(8, 0), pady=4)
-    ttk.Label(
-        tab_import_accounts,
-        textvariable=import_mode_hint_var,
-        style="Hint.TLabel",
-        justify="left",
-        wraplength=980,
-    ).grid(row=4, column=1, columnspan=2, sticky="w", pady=(0, 2))
-    import_recursive_check = ttk.Checkbutton(tab_import_accounts, text="同时扫描子文件夹里的 JSON 文件", variable=import_recursive_var)
-    import_recursive_check.grid(row=5, column=1, sticky="w", pady=2)
-    ttk.Checkbutton(
-        tab_import_accounts,
-        text="保留导入文件里的分组设置，不额外补默认分组",
-        variable=skip_default_group_bind_var,
-    ).grid(row=6, column=1, columnspan=2, sticky="w", pady=2)
+    def build_import_accounts_tab(tab_import_accounts: ttk.Frame) -> None:
+        tab_import_accounts.columnconfigure(1, weight=1)
+        import_mode_var = tk.StringVar(value="file")
+        import_source_var = tk.StringVar()
+        import_mode_hint_var = tk.StringVar()
+        import_recursive_var = tk.BooleanVar(value=True)
+        skip_default_group_bind_var = tk.BooleanVar(value=True)
+        ttk.Label(tab_import_accounts, text="把导出的账号 JSON 导入到当前网站。", style="Title.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        ttk.Label(
+            tab_import_accounts,
+            text="先选择导入方式，再选择一个文件或一个文件夹即可。建议先点“先检查文件格式”；如果检查不通过，再去旁边的“转换账号 JSON”页处理。",
+            style="Hint.TLabel",
+            justify="left",
+            wraplength=980,
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 10))
+        ttk.Label(tab_import_accounts, text="导入方式").grid(row=2, column=0, sticky="w")
+        ttk.Radiobutton(tab_import_accounts, text="单个 JSON 文件", variable=import_mode_var, value="file").grid(row=2, column=1, sticky="w")
+        ttk.Radiobutton(tab_import_accounts, text="整个文件夹批量导入", variable=import_mode_var, value="folder").grid(row=2, column=2, sticky="w")
+        import_source_label = ttk.Label(tab_import_accounts, text="导入来源文件")
+        import_source_label.grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(tab_import_accounts, textvariable=import_source_var).grid(row=3, column=1, sticky="ew", pady=4)
+        import_source_btn = ttk.Button(tab_import_accounts, text="选择文件")
+        import_source_btn.grid(row=3, column=2, padx=(8, 0), pady=4)
+        ttk.Label(
+            tab_import_accounts,
+            textvariable=import_mode_hint_var,
+            style="Hint.TLabel",
+            justify="left",
+            wraplength=980,
+        ).grid(row=4, column=1, columnspan=2, sticky="w", pady=(0, 2))
+        import_recursive_check = ttk.Checkbutton(tab_import_accounts, text="同时扫描子文件夹里的 JSON 文件", variable=import_recursive_var)
+        import_recursive_check.grid(row=5, column=1, sticky="w", pady=2)
+        ttk.Checkbutton(
+            tab_import_accounts,
+            text="保留导入文件里的分组设置，不额外补默认分组",
+            variable=skip_default_group_bind_var,
+        ).grid(row=6, column=1, columnspan=2, sticky="w", pady=2)
 
-    def refresh_import_mode_ui(*_args: Any) -> None:
-        mode = import_mode_var.get().strip() or "file"
-        current_path = non_empty(import_source_var.get())
-        if current_path:
-            current = Path(current_path)
-            if mode == "file" and current.is_dir():
-                import_source_var.set("")
-            elif mode == "folder" and current.is_file():
-                import_source_var.set("")
+        def refresh_import_mode_ui(*_args: Any) -> None:
+            mode = import_mode_var.get().strip() or "file"
+            current_path = non_empty(import_source_var.get())
+            if current_path:
+                current = Path(current_path)
+                if mode == "file" and current.is_dir():
+                    import_source_var.set("")
+                elif mode == "folder" and current.is_file():
+                    import_source_var.set("")
 
-        if mode == "folder":
-            import_source_label.configure(text="导入来源文件夹")
-            import_source_btn.configure(text="选择文件夹", command=lambda: pick_directory(import_source_var))
-            import_mode_hint_var.set("适合一个目录里放了多个账号导出 JSON，程序会自动逐个导入。")
-            import_recursive_check.grid()
-            return
+            if mode == "folder":
+                import_source_label.configure(text="导入来源文件夹")
+                import_source_btn.configure(text="选择文件夹", command=lambda: pick_directory(import_source_var))
+                import_mode_hint_var.set("适合一个目录里放了多个账号导出 JSON，程序会自动逐个导入。")
+                import_recursive_check.grid()
+                return
 
-        import_source_label.configure(text="导入来源文件")
-        import_source_btn.configure(text="选择文件", command=lambda: pick_json(import_source_var))
-        import_mode_hint_var.set("适合一次导入一个账号导出 JSON 文件。")
-        import_recursive_check.grid_remove()
+            import_source_label.configure(text="导入来源文件")
+            import_source_btn.configure(text="选择文件", command=lambda: pick_json(import_source_var))
+            import_mode_hint_var.set("适合一次导入一个账号导出 JSON 文件。")
+            import_recursive_check.grid_remove()
 
-    import_mode_var.trace_add("write", refresh_import_mode_ui)
-    refresh_import_mode_ui()
+        import_mode_var.trace_add("write", refresh_import_mode_ui)
+        refresh_import_mode_ui()
 
-    def check_import_accounts_action(progress_callback: Callable[[int, int, str], None]) -> Any:
-        mode = import_mode_var.get().strip() or "file"
-        source_path = non_empty(import_source_var.get())
-        source_root, files = collect_json_input_files(
-            mode,
-            source_path,
-            recursive=bool(import_recursive_var.get()),
-            purpose_label="账号导入 JSON ",
-        )
-        result = inspect_accounts_import_files(
-            files,
-            skip_default_group_bind=bool(skip_default_group_bind_var.get()),
-            progress_callback=progress_callback,
-            keep_payloads=False,
-            include_single_preview=True,
-        )
-        result["mode"] = mode
-        result["source_root"] = str(source_root)
-        result["source"] = source_path
-        if len(files) == 1 and result.get("preview") is not None:
-            result["normalized_request"] = result["preview"]
-        return result
+        def check_import_accounts_action(progress_callback: Callable[[int, int, str], None]) -> Any:
+            mode = import_mode_var.get().strip() or "file"
+            source_path = non_empty(import_source_var.get())
+            source_root, files = collect_json_input_files(
+                mode,
+                source_path,
+                recursive=bool(import_recursive_var.get()),
+                purpose_label="账号导入 JSON ",
+            )
+            result = inspect_accounts_import_files(
+                files,
+                skip_default_group_bind=bool(skip_default_group_bind_var.get()),
+                progress_callback=progress_callback,
+                keep_payloads=False,
+                include_single_preview=True,
+            )
+            result["mode"] = mode
+            result["source_root"] = str(source_root)
+            result["source"] = source_path
+            if len(files) == 1 and result.get("preview") is not None:
+                result["normalized_request"] = result["preview"]
+            return result
 
-    def import_accounts_action(progress_callback: Callable[[int, int, str], None]) -> Any:
-        mode = import_mode_var.get().strip()
-        skip_default_group_bind = bool(skip_default_group_bind_var.get())
-        client = get_client()
-        source_path = non_empty(import_source_var.get())
-        source_root, files = collect_json_input_files(
-            mode,
-            source_path,
-            recursive=bool(import_recursive_var.get()),
-            purpose_label="账号导入 JSON ",
-        )
-        validation_result = inspect_accounts_import_files(
-            files,
-            skip_default_group_bind=skip_default_group_bind,
-            progress_callback=progress_callback,
-            keep_payloads=True,
-            include_single_preview=False,
-        )
-        if not validation_result["ok"]:
-            raise CLIError(summarize_invalid_file_checks(validation_result, action_label="账号导入"))
+        def import_accounts_action(progress_callback: Callable[[int, int, str], None]) -> Any:
+            mode = import_mode_var.get().strip()
+            skip_default_group_bind = bool(skip_default_group_bind_var.get())
+            client = get_client()
+            source_path = non_empty(import_source_var.get())
+            source_root, files = collect_json_input_files(
+                mode,
+                source_path,
+                recursive=bool(import_recursive_var.get()),
+                purpose_label="账号导入 JSON ",
+            )
+            validation_result = inspect_accounts_import_files(
+                files,
+                skip_default_group_bind=skip_default_group_bind,
+                progress_callback=progress_callback,
+                keep_payloads=True,
+                include_single_preview=False,
+            )
+            if not validation_result["ok"]:
+                raise CLIError(summarize_invalid_file_checks(validation_result, action_label="账号导入"))
 
-        prepared_payloads = validation_result.get("prepared_payloads") or []
-        if mode == "file":
-            if not prepared_payloads or not isinstance(prepared_payloads[0].get("request_payload"), dict):
-                raise CLIError("文件检查通过，但未能生成可导入请求体")
-            progress_callback(0, 1, f"准备导入文件: {Path(source_path or '').name}")
-            result = client.request("POST", "/admin/accounts/data", prepared_payloads[0]["request_payload"])
-            progress_callback(1, 1, "文件导入完成")
+            prepared_payloads = validation_result.get("prepared_payloads") or []
+            if mode == "file":
+                if not prepared_payloads or not isinstance(prepared_payloads[0].get("request_payload"), dict):
+                    raise CLIError("文件检查通过，但未能生成可导入请求体")
+                progress_callback(0, 1, f"准备导入文件: {Path(source_path or '').name}")
+                result = client.request("POST", "/admin/accounts/data", prepared_payloads[0]["request_payload"])
+                progress_callback(1, 1, "文件导入完成")
+                return {
+                    "mode": "file",
+                    "file": source_path,
+                    "source_root": str(source_root),
+                    "validation_warnings": validation_result["warning_count"],
+                    "result": result,
+                }
+
+            summary: dict[str, int] = {
+                "proxy_created": 0,
+                "proxy_reused": 0,
+                "proxy_failed": 0,
+                "account_created": 0,
+                "account_failed": 0,
+            }
+            details: list[dict[str, Any]] = []
+            failed_files = 0
+            for index, prepared in enumerate(prepared_payloads, start=1):
+                file = Path(str(prepared.get("file") or ""))
+                request_payload = prepared.get("request_payload")
+                if not isinstance(request_payload, dict):
+                    failed_files += 1
+                    details.append({"file": str(file), "ok": False, "error": "未生成可导入请求体"})
+                    continue
+                progress_callback(index - 1, len(prepared_payloads), f"导入 {index}/{len(prepared_payloads)}: {file.name}")
+                try:
+                    result = client.request("POST", "/admin/accounts/data", request_payload)
+                    if not isinstance(result, dict):
+                        raise CLIError("`/admin/accounts/data` 返回格式异常")
+                    for key in summary:
+                        summary[key] += parse_int_field(result.get(key), 0)
+                    details.append({"file": str(file), "ok": True, "result": result})
+                except Exception as exc:
+                    failed_files += 1
+                    details.append({"file": str(file), "ok": False, "error": str(exc)})
+
+            progress_callback(len(prepared_payloads), len(prepared_payloads), f"批量导入完成，共 {len(prepared_payloads)} 个文件")
             return {
-                "mode": "file",
-                "file": source_path,
+                "mode": "folder",
+                "folder": str(source_path),
                 "source_root": str(source_root),
+                "total_files": len(prepared_payloads),
+                "failed_files": failed_files,
+                "success_files": len(prepared_payloads) - failed_files,
                 "validation_warnings": validation_result["warning_count"],
-                "result": result,
+                "summary": summary,
+                "details": details,
             }
 
-        summary: dict[str, int] = {
-            "proxy_created": 0,
-            "proxy_reused": 0,
-            "proxy_failed": 0,
-            "account_created": 0,
-            "account_failed": 0,
-        }
-        details: list[dict[str, Any]] = []
-        failed_files = 0
-        for index, prepared in enumerate(prepared_payloads, start=1):
-            file = Path(str(prepared.get("file") or ""))
-            request_payload = prepared.get("request_payload")
-            if not isinstance(request_payload, dict):
-                failed_files += 1
-                details.append({"file": str(file), "ok": False, "error": "未生成可导入请求体"})
-                continue
-            progress_callback(index - 1, len(prepared_payloads), f"导入 {index}/{len(prepared_payloads)}: {file.name}")
-            try:
-                result = client.request("POST", "/admin/accounts/data", request_payload)
-                if not isinstance(result, dict):
-                    raise CLIError("`/admin/accounts/data` 返回格式异常")
-                for key in summary:
-                    summary[key] += parse_int_field(result.get(key), 0)
-                details.append({"file": str(file), "ok": True, "result": result})
-            except Exception as exc:
-                failed_files += 1
-                details.append({"file": str(file), "ok": False, "error": str(exc)})
+        import_accounts_check_btn = ttk.Button(
+            tab_import_accounts,
+            text="先检查文件格式",
+            command=lambda: run_action("检查账号导入 JSON", check_import_accounts_action, determinate=True),
+        )
+        import_accounts_check_btn.grid(row=7, column=0, sticky="w", pady=6)
+        action_buttons.append(import_accounts_check_btn)
+        import_accounts_btn = ttk.Button(
+            tab_import_accounts,
+            text="开始导入账号数据",
+            command=lambda: run_action("导入账号数据", import_accounts_action, determinate=True),
+        )
+        import_accounts_btn.grid(row=7, column=1, sticky="w", pady=6)
+        action_buttons.append(import_accounts_btn)
 
-        progress_callback(len(prepared_payloads), len(prepared_payloads), f"批量导入完成，共 {len(prepared_payloads)} 个文件")
-        return {
-            "mode": "folder",
-            "folder": str(source_path),
-            "source_root": str(source_root),
-            "total_files": len(prepared_payloads),
-            "failed_files": failed_files,
-            "success_files": len(prepared_payloads) - failed_files,
-            "validation_warnings": validation_result["warning_count"],
-            "summary": summary,
-            "details": details,
-        }
-
-    import_accounts_check_btn = ttk.Button(
-        tab_import_accounts,
-        text="先检查文件格式",
-        command=lambda: run_action("检查账号导入 JSON", check_import_accounts_action, determinate=True),
-    )
-    import_accounts_check_btn.grid(row=7, column=0, sticky="w", pady=6)
-    action_buttons.append(import_accounts_check_btn)
-    import_accounts_btn = ttk.Button(
-        tab_import_accounts,
-        text="开始导入账号数据",
-        command=lambda: run_action("导入账号数据", import_accounts_action, determinate=True),
-    )
-    import_accounts_btn.grid(row=7, column=1, sticky="w", pady=6)
-    action_buttons.append(import_accounts_btn)
+    tab_import_accounts = register_lazy_tab("导入账号数据", build_import_accounts_tab)
 
     # 转换账号 JSON
-    tab_convert_accounts = add_tab("转换账号 JSON")
-    tab_convert_accounts.columnconfigure(1, weight=1)
-    convert_mode_var = tk.StringVar(value="file")
-    convert_source_var = tk.StringVar()
-    convert_output_var = tk.StringVar()
-    convert_accounts_per_file_var = tk.StringVar(value="1")
-    convert_mode_hint_var = tk.StringVar()
-    convert_output_hint_var = tk.StringVar(value="未填写输出文件夹时，默认写到源目录下的 `s2a-manager-converted` 文件夹。")
-    convert_recursive_var = tk.BooleanVar(value=True)
+    def build_convert_accounts_tab(tab_convert_accounts: ttk.Frame) -> None:
+        tab_convert_accounts.columnconfigure(1, weight=1)
+        convert_mode_var = tk.StringVar(value="file")
+        convert_source_var = tk.StringVar()
+        convert_output_var = tk.StringVar()
+        convert_accounts_per_file_var = tk.StringVar(value="1")
+        convert_mode_hint_var = tk.StringVar()
+        convert_output_hint_var = tk.StringVar(value="未填写输出文件夹时，默认写到源目录下的 `s2a-manager-converted` 文件夹。")
+        convert_recursive_var = tk.BooleanVar(value=True)
 
-    ttk.Label(tab_convert_accounts, text="把简化账号 JSON 批量转成 S2A Manager 可直接导入的标准 JSON。", style="Title.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
-    ttk.Label(
-        tab_convert_accounts,
-        text="支持单文件和整个文件夹。只要原始 JSON 至少能提供 name、platform、type，以及 credentials 或可识别的常见凭证字段，就能自动转换。",
-        style="Hint.TLabel",
-        justify="left",
-        wraplength=980,
-    ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 10))
-    ttk.Label(tab_convert_accounts, text="转换方式").grid(row=2, column=0, sticky="w")
-    ttk.Radiobutton(tab_convert_accounts, text="单个 JSON 文件", variable=convert_mode_var, value="file").grid(row=2, column=1, sticky="w")
-    ttk.Radiobutton(tab_convert_accounts, text="整个文件夹批量转换", variable=convert_mode_var, value="folder").grid(row=2, column=2, sticky="w")
+        ttk.Label(tab_convert_accounts, text="把简化账号 JSON 批量转成 S2A Manager 可直接导入的标准 JSON。", style="Title.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        ttk.Label(
+            tab_convert_accounts,
+            text="支持单文件和整个文件夹。只要原始 JSON 至少能提供 name、platform、type，以及 credentials 或可识别的常见凭证字段，就能自动转换。",
+            style="Hint.TLabel",
+            justify="left",
+            wraplength=980,
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 10))
+        ttk.Label(tab_convert_accounts, text="转换方式").grid(row=2, column=0, sticky="w")
+        ttk.Radiobutton(tab_convert_accounts, text="单个 JSON 文件", variable=convert_mode_var, value="file").grid(row=2, column=1, sticky="w")
+        ttk.Radiobutton(tab_convert_accounts, text="整个文件夹批量转换", variable=convert_mode_var, value="folder").grid(row=2, column=2, sticky="w")
 
-    convert_source_label = ttk.Label(tab_convert_accounts, text="待转换文件")
-    convert_source_label.grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
-    ttk.Entry(tab_convert_accounts, textvariable=convert_source_var).grid(row=3, column=1, sticky="ew", pady=4)
-    convert_source_btn = ttk.Button(tab_convert_accounts, text="选择文件")
-    convert_source_btn.grid(row=3, column=2, padx=(8, 0), pady=4)
-    ttk.Label(tab_convert_accounts, textvariable=convert_mode_hint_var, style="Hint.TLabel", justify="left", wraplength=980).grid(row=4, column=1, columnspan=2, sticky="w", pady=(0, 2))
-    convert_recursive_check = ttk.Checkbutton(tab_convert_accounts, text="同时扫描子文件夹里的 JSON 文件", variable=convert_recursive_var)
-    convert_recursive_check.grid(row=5, column=1, sticky="w", pady=2)
+        convert_source_label = ttk.Label(tab_convert_accounts, text="待转换文件")
+        convert_source_label.grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(tab_convert_accounts, textvariable=convert_source_var).grid(row=3, column=1, sticky="ew", pady=4)
+        convert_source_btn = ttk.Button(tab_convert_accounts, text="选择文件")
+        convert_source_btn.grid(row=3, column=2, padx=(8, 0), pady=4)
+        ttk.Label(tab_convert_accounts, textvariable=convert_mode_hint_var, style="Hint.TLabel", justify="left", wraplength=980).grid(row=4, column=1, columnspan=2, sticky="w", pady=(0, 2))
+        convert_recursive_check = ttk.Checkbutton(tab_convert_accounts, text="同时扫描子文件夹里的 JSON 文件", variable=convert_recursive_var)
+        convert_recursive_check.grid(row=5, column=1, sticky="w", pady=2)
 
-    ttk.Label(tab_convert_accounts, text="输出文件夹").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=4)
-    ttk.Entry(tab_convert_accounts, textvariable=convert_output_var).grid(row=6, column=1, sticky="ew", pady=4)
-    convert_output_btn = ttk.Button(tab_convert_accounts, text="选择文件夹", command=lambda: pick_directory(convert_output_var))
-    convert_output_btn.grid(row=6, column=2, padx=(8, 0), pady=4)
-    action_buttons.append(convert_output_btn)
-    ttk.Label(tab_convert_accounts, textvariable=convert_output_hint_var, style="Hint.TLabel", justify="left", wraplength=980).grid(row=7, column=1, columnspan=2, sticky="w", pady=(0, 4))
-    ttk.Label(tab_convert_accounts, text="每个输出文件包含账号数").grid(row=8, column=0, sticky="w", padx=(0, 8), pady=4)
-    ttk.Entry(tab_convert_accounts, textvariable=convert_accounts_per_file_var, width=10).grid(row=8, column=1, sticky="w", pady=4)
+        ttk.Label(tab_convert_accounts, text="输出文件夹").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(tab_convert_accounts, textvariable=convert_output_var).grid(row=6, column=1, sticky="ew", pady=4)
+        convert_output_btn = ttk.Button(tab_convert_accounts, text="选择文件夹", command=lambda: pick_directory(convert_output_var))
+        convert_output_btn.grid(row=6, column=2, padx=(8, 0), pady=4)
+        action_buttons.append(convert_output_btn)
+        ttk.Label(tab_convert_accounts, textvariable=convert_output_hint_var, style="Hint.TLabel", justify="left", wraplength=980).grid(row=7, column=1, columnspan=2, sticky="w", pady=(0, 4))
+        ttk.Label(tab_convert_accounts, text="每个输出文件包含账号数").grid(row=8, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(tab_convert_accounts, textvariable=convert_accounts_per_file_var, width=10).grid(row=8, column=1, sticky="w", pady=4)
 
-    def refresh_convert_mode_ui(*_args: Any) -> None:
-        mode = convert_mode_var.get().strip() or "file"
-        current_path = non_empty(convert_source_var.get())
-        if current_path:
-            current = Path(current_path)
-            if mode == "file" and current.is_dir():
-                convert_source_var.set("")
-            elif mode == "folder" and current.is_file():
-                convert_source_var.set("")
+        def refresh_convert_mode_ui(*_args: Any) -> None:
+            mode = convert_mode_var.get().strip() or "file"
+            current_path = non_empty(convert_source_var.get())
+            if current_path:
+                current = Path(current_path)
+                if mode == "file" and current.is_dir():
+                    convert_source_var.set("")
+                elif mode == "folder" and current.is_file():
+                    convert_source_var.set("")
 
-        if mode == "folder":
-            convert_source_label.configure(text="待转换文件夹")
-            convert_source_btn.configure(text="选择文件夹", command=lambda: pick_directory(convert_source_var))
-            convert_mode_hint_var.set("适合一个目录里放了多个账号 JSON，程序会自动逐个检查、预览并输出标准导入文件。")
-            convert_recursive_check.grid()
-        else:
-            convert_source_label.configure(text="待转换文件")
-            convert_source_btn.configure(text="选择文件", command=lambda: pick_json(convert_source_var))
-            convert_mode_hint_var.set("适合先拿一个文件试转换结果，确认没问题后再批量处理。")
-            convert_recursive_check.grid_remove()
+            if mode == "folder":
+                convert_source_label.configure(text="待转换文件夹")
+                convert_source_btn.configure(text="选择文件夹", command=lambda: pick_directory(convert_source_var))
+                convert_mode_hint_var.set("适合一个目录里放了多个账号 JSON，程序会自动逐个检查、预览并输出标准导入文件。")
+                convert_recursive_check.grid()
+            else:
+                convert_source_label.configure(text="待转换文件")
+                convert_source_btn.configure(text="选择文件", command=lambda: pick_json(convert_source_var))
+                convert_mode_hint_var.set("适合先拿一个文件试转换结果，确认没问题后再批量处理。")
+                convert_recursive_check.grid_remove()
 
-        suggested_dir = None
-        source_value = non_empty(convert_source_var.get())
-        if source_value:
-            try:
-                suggested_dir = resolve_conversion_output_dir(mode, source_value, None)
-            except CLIError:
-                suggested_dir = None
-        if suggested_dir is not None:
-            convert_output_hint_var.set(f"未填写输出文件夹时，默认写到：{suggested_dir}")
-        else:
-            convert_output_hint_var.set("未填写输出文件夹时，默认写到源目录下的 `s2a-manager-converted` 文件夹。")
+            suggested_dir = None
+            source_value = non_empty(convert_source_var.get())
+            if source_value:
+                try:
+                    suggested_dir = resolve_conversion_output_dir(mode, source_value, None)
+                except CLIError:
+                    suggested_dir = None
+            if suggested_dir is not None:
+                convert_output_hint_var.set(f"未填写输出文件夹时，默认写到：{suggested_dir}")
+            else:
+                convert_output_hint_var.set("未填写输出文件夹时，默认写到源目录下的 `s2a-manager-converted` 文件夹。")
 
-    convert_mode_var.trace_add("write", refresh_convert_mode_ui)
-    convert_source_var.trace_add("write", refresh_convert_mode_ui)
-    refresh_convert_mode_ui()
+        convert_mode_var.trace_add("write", refresh_convert_mode_ui)
+        convert_source_var.trace_add("write", refresh_convert_mode_ui)
+        refresh_convert_mode_ui()
 
-    def check_convert_accounts_action(progress_callback: Callable[[int, int, str], None]) -> Any:
-        mode = convert_mode_var.get().strip() or "file"
-        source_path = non_empty(convert_source_var.get())
-        accounts_per_file = parse_optional_positive_int(convert_accounts_per_file_var.get(), "每个输出文件包含账号数") or 1
-        source_root, files = collect_json_input_files(
-            mode,
-            source_path,
-            recursive=bool(convert_recursive_var.get()),
-            purpose_label="待转换 JSON ",
-        )
-        result = inspect_convertible_json_files(
-            files,
-            progress_callback=progress_callback,
-            keep_payloads=False,
-            include_preview=True,
-        )
-        result["mode"] = mode
-        result["source_root"] = str(source_root)
-        result["source"] = source_path
-        result["accounts_per_file"] = accounts_per_file
-        result["output_dir"] = str(resolve_conversion_output_dir(mode, source_path, non_empty(convert_output_var.get())))
-        if result["ok"]:
-            merged_payload = merge_exported_accounts_payloads(
-                [item["data_payload"] for item in result.get("converted_payloads", []) if isinstance(item.get("data_payload"), dict)]
-            ) if result.get("converted_payloads") else None
-            if merged_payload is None:
-                inspection_preview = inspect_convertible_json_files(
-                    files,
-                    progress_callback=lambda *_args: None,
-                    keep_payloads=True,
-                    include_preview=False,
-                )
+        def check_convert_accounts_action(progress_callback: Callable[[int, int, str], None]) -> Any:
+            mode = convert_mode_var.get().strip() or "file"
+            source_path = non_empty(convert_source_var.get())
+            accounts_per_file = parse_optional_positive_int(convert_accounts_per_file_var.get(), "每个输出文件包含账号数") or 1
+            source_root, files = collect_json_input_files(
+                mode,
+                source_path,
+                recursive=bool(convert_recursive_var.get()),
+                purpose_label="待转换 JSON ",
+            )
+            result = inspect_convertible_json_files(
+                files,
+                progress_callback=progress_callback,
+                keep_payloads=False,
+                include_preview=True,
+            )
+            result["mode"] = mode
+            result["source_root"] = str(source_root)
+            result["source"] = source_path
+            result["accounts_per_file"] = accounts_per_file
+            result["output_dir"] = str(resolve_conversion_output_dir(mode, source_path, non_empty(convert_output_var.get())))
+            if result["ok"]:
                 merged_payload = merge_exported_accounts_payloads(
-                    [item["data_payload"] for item in inspection_preview.get("converted_payloads", []) if isinstance(item.get("data_payload"), dict)]
-                )
+                    [item["data_payload"] for item in result.get("converted_payloads", []) if isinstance(item.get("data_payload"), dict)]
+                ) if result.get("converted_payloads") else None
+                if merged_payload is None:
+                    inspection_preview = inspect_convertible_json_files(
+                        files,
+                        progress_callback=lambda *_args: None,
+                        keep_payloads=True,
+                        include_preview=False,
+                    )
+                    merged_payload = merge_exported_accounts_payloads(
+                        [item["data_payload"] for item in inspection_preview.get("converted_payloads", []) if isinstance(item.get("data_payload"), dict)]
+                    )
+                file_plans = build_accounts_export_file_plans(merged_payload, accounts_per_file=accounts_per_file)
+                result["total_accounts"] = len(merged_payload.get("accounts") or [])
+                result["total_proxies"] = len(merged_payload.get("proxies") or [])
+                result["planned_files"] = len(file_plans)
+            if len(files) == 1 and result.get("preview") is not None:
+                result["converted_data"] = result["preview"]
+            return result
+
+        def preview_convert_accounts_action(progress_callback: Callable[[int, int, str], None]) -> Any:
+            mode = convert_mode_var.get().strip() or "file"
+            source_path = non_empty(convert_source_var.get())
+            accounts_per_file = parse_optional_positive_int(convert_accounts_per_file_var.get(), "每个输出文件包含账号数") or 1
+            source_root, files = collect_json_input_files(
+                mode,
+                source_path,
+                recursive=bool(convert_recursive_var.get()),
+                purpose_label="待转换 JSON ",
+            )
+            result = inspect_convertible_json_files(
+                files,
+                progress_callback=progress_callback,
+                keep_payloads=True,
+                include_preview=True,
+            )
+            preview_payload = result.get("preview")
+            converted_payloads = result.pop("converted_payloads", [])
+            if preview_payload is None and converted_payloads:
+                preview_payload = converted_payloads[0].get("data_payload")
+                result["preview_file"] = converted_payloads[0].get("file")
+            merged_payload = merge_exported_accounts_payloads(
+                [item["data_payload"] for item in converted_payloads if isinstance(item.get("data_payload"), dict)]
+            )
             file_plans = build_accounts_export_file_plans(merged_payload, accounts_per_file=accounts_per_file)
+            result["mode"] = mode
+            result["source_root"] = str(source_root)
+            result["source"] = source_path
+            result["accounts_per_file"] = accounts_per_file
+            result["output_dir"] = str(resolve_conversion_output_dir(mode, source_path, non_empty(convert_output_var.get())))
             result["total_accounts"] = len(merged_payload.get("accounts") or [])
             result["total_proxies"] = len(merged_payload.get("proxies") or [])
             result["planned_files"] = len(file_plans)
-        if len(files) == 1 and result.get("preview") is not None:
-            result["converted_data"] = result["preview"]
-        return result
+            if file_plans:
+                result["first_output_preview"] = file_plans[0]["payload"]
+            if preview_payload is not None:
+                result["converted_data"] = preview_payload
+            return result
 
-    def preview_convert_accounts_action(progress_callback: Callable[[int, int, str], None]) -> Any:
-        mode = convert_mode_var.get().strip() or "file"
-        source_path = non_empty(convert_source_var.get())
-        accounts_per_file = parse_optional_positive_int(convert_accounts_per_file_var.get(), "每个输出文件包含账号数") or 1
-        source_root, files = collect_json_input_files(
-            mode,
-            source_path,
-            recursive=bool(convert_recursive_var.get()),
-            purpose_label="待转换 JSON ",
-        )
-        result = inspect_convertible_json_files(
-            files,
-            progress_callback=progress_callback,
-            keep_payloads=True,
-            include_preview=True,
-        )
-        preview_payload = result.get("preview")
-        converted_payloads = result.pop("converted_payloads", [])
-        if preview_payload is None and converted_payloads:
-            preview_payload = converted_payloads[0].get("data_payload")
-            result["preview_file"] = converted_payloads[0].get("file")
-        merged_payload = merge_exported_accounts_payloads(
-            [item["data_payload"] for item in converted_payloads if isinstance(item.get("data_payload"), dict)]
-        )
-        file_plans = build_accounts_export_file_plans(merged_payload, accounts_per_file=accounts_per_file)
-        result["mode"] = mode
-        result["source_root"] = str(source_root)
-        result["source"] = source_path
-        result["accounts_per_file"] = accounts_per_file
-        result["output_dir"] = str(resolve_conversion_output_dir(mode, source_path, non_empty(convert_output_var.get())))
-        result["total_accounts"] = len(merged_payload.get("accounts") or [])
-        result["total_proxies"] = len(merged_payload.get("proxies") or [])
-        result["planned_files"] = len(file_plans)
-        if file_plans:
-            result["first_output_preview"] = file_plans[0]["payload"]
-        if preview_payload is not None:
-            result["converted_data"] = preview_payload
-        return result
-
-    def convert_accounts_json_action(progress_callback: Callable[[int, int, str], None]) -> Any:
-        mode = convert_mode_var.get().strip() or "file"
-        source_path = non_empty(convert_source_var.get())
-        source_root, files = collect_json_input_files(
-            mode,
-            source_path,
-            recursive=bool(convert_recursive_var.get()),
-            purpose_label="待转换 JSON ",
-        )
-        accounts_per_file = parse_optional_positive_int(convert_accounts_per_file_var.get(), "每个输出文件包含账号数") or 1
-        inspection = inspect_convertible_json_files(
-            files,
-            progress_callback=progress_callback,
-            keep_payloads=True,
-            include_preview=False,
-        )
-        if not inspection["ok"]:
-            raise CLIError(summarize_invalid_file_checks(inspection, action_label="JSON 转换"))
-
-        output_dir = resolve_conversion_output_dir(mode, source_path, non_empty(convert_output_var.get()))
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        converted_payloads = inspection.get("converted_payloads") or []
-        merged_payload = merge_exported_accounts_payloads(
-            [item["data_payload"] for item in converted_payloads if isinstance(item.get("data_payload"), dict)]
-        )
-        file_plans = build_accounts_export_file_plans(merged_payload, accounts_per_file=accounts_per_file)
-        written_files: list[dict[str, Any]] = []
-        used_names: dict[str, int] = {}
-        for index, plan in enumerate(file_plans, start=1):
-            data_payload = plan.get("payload")
-            if not isinstance(data_payload, dict):
-                raise CLIError("转换分片结果缺少标准导入 JSON")
-            target = make_unique_json_output_path(output_dir, str(plan.get("name_base") or f"accounts-{index}"), used_names)
-            progress_callback(index, len(file_plans), f"写出文件 {index}/{len(file_plans)}")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(json.dumps(data_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            written_files.append(
-                {
-                    "target": str(target),
-                    "account_count": len(data_payload.get("accounts") or []),
-                    "proxy_count": len(data_payload.get("proxies") or []),
-                    "account_names_preview": list(plan.get("account_names") or [])[:10],
-                }
+        def convert_accounts_json_action(progress_callback: Callable[[int, int, str], None]) -> Any:
+            mode = convert_mode_var.get().strip() or "file"
+            source_path = non_empty(convert_source_var.get())
+            source_root, files = collect_json_input_files(
+                mode,
+                source_path,
+                recursive=bool(convert_recursive_var.get()),
+                purpose_label="待转换 JSON ",
             )
+            accounts_per_file = parse_optional_positive_int(convert_accounts_per_file_var.get(), "每个输出文件包含账号数") or 1
+            inspection = inspect_convertible_json_files(
+                files,
+                progress_callback=progress_callback,
+                keep_payloads=True,
+                include_preview=False,
+            )
+            if not inspection["ok"]:
+                raise CLIError(summarize_invalid_file_checks(inspection, action_label="JSON 转换"))
 
-        progress_callback(len(file_plans), len(file_plans), f"转换完成，共输出 {len(written_files)} 个文件")
-        return {
-            "mode": mode,
-            "source": source_path,
-            "source_root": str(source_root),
-            "output_dir": str(output_dir),
-            "accounts_per_file": accounts_per_file,
-            "total_accounts": len(merged_payload.get("accounts") or []),
-            "total_proxies": len(merged_payload.get("proxies") or []),
-            "written_files": len(written_files),
-            "warning_count": inspection["warning_count"],
-            "files": written_files,
-        }
+            output_dir = resolve_conversion_output_dir(mode, source_path, non_empty(convert_output_var.get()))
+            output_dir.mkdir(parents=True, exist_ok=True)
 
-    convert_check_btn = ttk.Button(
-        tab_convert_accounts,
-        text="检查原文件",
-        command=lambda: run_action("检查待转换 JSON", check_convert_accounts_action, determinate=True),
-    )
-    convert_check_btn.grid(row=9, column=0, sticky="w", pady=6)
-    action_buttons.append(convert_check_btn)
-    convert_preview_btn = ttk.Button(
-        tab_convert_accounts,
-        text="预览转换结果",
-        command=lambda: run_action("预览转换结果", preview_convert_accounts_action, determinate=True),
-    )
-    convert_preview_btn.grid(row=9, column=1, sticky="w", pady=6)
-    action_buttons.append(convert_preview_btn)
-    convert_start_btn = ttk.Button(
-        tab_convert_accounts,
-        text="开始批量转换",
-        command=lambda: run_action("批量转换账号 JSON", convert_accounts_json_action, determinate=True),
-    )
-    convert_start_btn.grid(row=9, column=2, sticky="w", pady=6)
-    action_buttons.append(convert_start_btn)
+            converted_payloads = inspection.get("converted_payloads") or []
+            merged_payload = merge_exported_accounts_payloads(
+                [item["data_payload"] for item in converted_payloads if isinstance(item.get("data_payload"), dict)]
+            )
+            file_plans = build_accounts_export_file_plans(merged_payload, accounts_per_file=accounts_per_file)
+            written_files: list[dict[str, Any]] = []
+            used_names: dict[str, int] = {}
+            for index, plan in enumerate(file_plans, start=1):
+                data_payload = plan.get("payload")
+                if not isinstance(data_payload, dict):
+                    raise CLIError("转换分片结果缺少标准导入 JSON")
+                target = make_unique_json_output_path(output_dir, str(plan.get("name_base") or f"accounts-{index}"), used_names)
+                progress_callback(index, len(file_plans), f"写出文件 {index}/{len(file_plans)}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(json.dumps(data_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                written_files.append(
+                    {
+                        "target": str(target),
+                        "account_count": len(data_payload.get("accounts") or []),
+                        "proxy_count": len(data_payload.get("proxies") or []),
+                        "account_names_preview": list(plan.get("account_names") or [])[:10],
+                    }
+                )
+
+            progress_callback(len(file_plans), len(file_plans), f"转换完成，共输出 {len(written_files)} 个文件")
+            return {
+                "mode": mode,
+                "source": source_path,
+                "source_root": str(source_root),
+                "output_dir": str(output_dir),
+                "accounts_per_file": accounts_per_file,
+                "total_accounts": len(merged_payload.get("accounts") or []),
+                "total_proxies": len(merged_payload.get("proxies") or []),
+                "written_files": len(written_files),
+                "warning_count": inspection["warning_count"],
+                "files": written_files,
+            }
+
+        convert_check_btn = ttk.Button(
+            tab_convert_accounts,
+            text="检查原文件",
+            command=lambda: run_action("检查待转换 JSON", check_convert_accounts_action, determinate=True),
+        )
+        convert_check_btn.grid(row=9, column=0, sticky="w", pady=6)
+        action_buttons.append(convert_check_btn)
+        convert_preview_btn = ttk.Button(
+            tab_convert_accounts,
+            text="预览转换结果",
+            command=lambda: run_action("预览转换结果", preview_convert_accounts_action, determinate=True),
+        )
+        convert_preview_btn.grid(row=9, column=1, sticky="w", pady=6)
+        action_buttons.append(convert_preview_btn)
+        convert_start_btn = ttk.Button(
+            tab_convert_accounts,
+            text="开始批量转换",
+            command=lambda: run_action("批量转换账号 JSON", convert_accounts_json_action, determinate=True),
+        )
+        convert_start_btn.grid(row=9, column=2, sticky="w", pady=6)
+        action_buttons.append(convert_start_btn)
+
+    tab_convert_accounts = register_lazy_tab("转换账号 JSON", build_convert_accounts_tab)
 
     # 导入代理数据
     tab_import_proxies = add_tab("导入代理数据", scrollable=False)
@@ -4389,388 +4445,398 @@ def run_admin_gui(
     action_buttons.append(import_proxies_btn)
 
     # 批量调整账号
-    tab_bulk_all = add_tab("批量调整账号")
-    tab_bulk_all.columnconfigure(0, weight=1)
-    tab_bulk_all.rowconfigure(5, weight=1)
+    def build_bulk_all_tab(tab_bulk_all: ttk.Frame) -> None:
+        tab_bulk_all.columnconfigure(0, weight=1)
+        tab_bulk_all.rowconfigure(5, weight=1)
 
-    ttk.Label(tab_bulk_all, text="按条件筛选后，批量调整账号设置。", style="Title.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 4))
-    ttk.Label(
-        tab_bulk_all,
-        text="常见用法：先同步分组，再按平台、状态或当前分组筛选，最后选择要改成的分组、代理、状态等字段。预览和真正修改已分开，直接点开始批量调整就会实际提交。",
-        style="Hint.TLabel",
-        justify="left",
-        wraplength=980,
-    ).grid(row=1, column=0, sticky="w", pady=(0, 8))
+        ttk.Label(tab_bulk_all, text="按条件筛选后，批量调整账号设置。", style="Title.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        ttk.Label(
+            tab_bulk_all,
+            text="常见用法：先同步分组，再按平台、状态或当前分组筛选，最后选择要改成的分组、代理、状态等字段。预览和真正修改已分开，直接点开始批量调整就会实际提交。",
+            style="Hint.TLabel",
+            justify="left",
+            wraplength=980,
+        ).grid(row=1, column=0, sticky="w", pady=(0, 8))
 
-    filter_frame = ttk.LabelFrame(tab_bulk_all, text="筛选条件", padding=8)
-    filter_frame.grid(row=2, column=0, sticky="ew")
-    for c in range(6):
-        filter_frame.columnconfigure(c, weight=1 if c in (1, 3, 5) else 0)
+        filter_frame = ttk.LabelFrame(tab_bulk_all, text="筛选条件", padding=8)
+        filter_frame.grid(row=2, column=0, sticky="ew")
+        for c in range(6):
+            filter_frame.columnconfigure(c, weight=1 if c in (1, 3, 5) else 0)
 
-    account_ids_raw_var = tk.StringVar()
-    account_picker_var = tk.StringVar(value=ACCOUNT_PICKER_HINT)
-    account_selection_summary_var = tk.StringVar(value="未指定账号时，会按下面的筛选条件自动匹配。")
-    platform_var = tk.StringVar(value="(不限)")
-    account_type_var = tk.StringVar(value="(不限)")
-    account_status_var = tk.StringVar(value="(不限)")
-    search_var = tk.StringVar()
-    name_contains_var = tk.StringVar()
-    group_filter_var = tk.StringVar(value=GROUP_FILTER_ALL)
-    max_accounts_var = tk.StringVar()
-    page_size_var = tk.StringVar(value=str(saved_config.bulk_page_size))
-    batch_size_var = tk.StringVar(value=str(saved_config.bulk_batch_size))
-    ungrouped_only_var = tk.BooleanVar(value=False)
-    dry_run_var = tk.BooleanVar(value=False)
+        account_ids_raw_var = tk.StringVar()
+        account_picker_var = tk.StringVar(value=ACCOUNT_PICKER_HINT)
+        account_selection_summary_var = tk.StringVar(value="未指定账号时，会按下面的筛选条件自动匹配。")
+        platform_var = tk.StringVar(value="(不限)")
+        account_type_var = tk.StringVar(value="(不限)")
+        account_status_var = tk.StringVar(value="(不限)")
+        search_var = tk.StringVar()
+        name_contains_var = tk.StringVar()
+        group_filter_var = tk.StringVar(value=GROUP_FILTER_ALL)
+        max_accounts_var = tk.StringVar()
+        ungrouped_only_var = tk.BooleanVar(value=False)
+        dry_run_var = tk.BooleanVar(value=False)
 
-    ttk.Label(filter_frame, text="指定账号").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=3)
-    account_picker_frame = ttk.Frame(filter_frame)
-    account_picker_frame.grid(row=0, column=1, sticky="ew", pady=3)
-    account_picker_frame.columnconfigure(0, weight=1)
-    account_picker_combo = ttk.Combobox(account_picker_frame, textvariable=account_picker_var, values=[ACCOUNT_PICKER_HINT], state="readonly")
-    account_picker_combo.grid(row=0, column=0, sticky="ew")
-    account_picker_combos.append(account_picker_combo)
-    ttk.Label(filter_frame, text="平台").grid(row=0, column=2, sticky="w", padx=(8, 6), pady=3)
-    ttk.Combobox(filter_frame, textvariable=platform_var, values=["(不限)", "openai", "anthropic", "gemini", "antigravity"], state="readonly").grid(row=0, column=3, sticky="ew", pady=3)
-    ttk.Label(filter_frame, text="账号类型").grid(row=0, column=4, sticky="w", padx=(8, 6), pady=3)
-    ttk.Combobox(filter_frame, textvariable=account_type_var, values=["(不限)", "oauth", "apikey", "setup-token", "upstream", "bedrock"], state="readonly").grid(row=0, column=5, sticky="ew", pady=3)
-    ttk.Label(filter_frame, text="账号状态").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=3)
-    ttk.Combobox(filter_frame, textvariable=account_status_var, values=["(不限)", "active", "inactive", "error"], state="readonly").grid(row=1, column=1, sticky="ew", pady=3)
-    ttk.Label(filter_frame, text="搜索关键词").grid(row=1, column=2, sticky="w", padx=(8, 6), pady=3)
-    ttk.Entry(filter_frame, textvariable=search_var).grid(row=1, column=3, sticky="ew", pady=3)
-    ttk.Label(filter_frame, text="名称包含").grid(row=1, column=4, sticky="w", padx=(8, 6), pady=3)
-    ttk.Entry(filter_frame, textvariable=name_contains_var).grid(row=1, column=5, sticky="ew", pady=3)
-    ttk.Label(filter_frame, text="当前分组").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=3)
-    group_filter_combo = ttk.Combobox(filter_frame, textvariable=group_filter_var, values=[GROUP_FILTER_ALL], state="readonly")
-    group_filter_combo.grid(row=2, column=1, sticky="ew", pady=3)
-    group_filter_combos.append(group_filter_combo)
-    ttk.Label(filter_frame, text="最多处理数量").grid(row=2, column=2, sticky="w", padx=(8, 6), pady=3)
-    ttk.Entry(filter_frame, textvariable=max_accounts_var).grid(row=2, column=3, sticky="ew", pady=3)
-    ttk.Label(filter_frame, text="每次读取数量").grid(row=2, column=4, sticky="w", padx=(8, 6), pady=3)
-    ttk.Entry(filter_frame, textvariable=page_size_var).grid(row=2, column=5, sticky="ew", pady=3)
-    ttk.Label(filter_frame, text="每次提交数量").grid(row=3, column=0, sticky="w", padx=(0, 6), pady=3)
-    ttk.Entry(filter_frame, textvariable=batch_size_var).grid(row=3, column=1, sticky="ew", pady=3)
-    ttk.Checkbutton(filter_frame, text="仅未分组账号", variable=ungrouped_only_var).grid(row=3, column=2, sticky="w", pady=3)
-    ttk.Checkbutton(filter_frame, text="开始调整前先做预览", variable=dry_run_var).grid(row=3, column=3, sticky="w", pady=3)
-    smart_refresh_btn = ttk.Button(filter_frame, text="同步分组选项", command=lambda: run_action("同步分组", fetch_groups, determinate=True))
-    smart_refresh_btn.grid(row=3, column=5, sticky="e", pady=3)
-    action_buttons.append(smart_refresh_btn)
-    smart_sync_accounts_btn = ttk.Button(filter_frame, text="同步账号列表", command=lambda: run_action("同步账号列表", fetch_accounts, determinate=True))
-    smart_sync_accounts_btn.grid(row=4, column=4, sticky="e", pady=3)
-    action_buttons.append(smart_sync_accounts_btn)
-    smart_sync_proxies_btn = ttk.Button(filter_frame, text="同步代理列表", command=lambda: run_action("同步代理列表", fetch_proxies, determinate=True))
-    smart_sync_proxies_btn.grid(row=4, column=5, sticky="e", pady=3)
-    action_buttons.append(smart_sync_proxies_btn)
-    ttk.Label(filter_frame, textvariable=account_selection_summary_var, style="Hint.TLabel", justify="left", wraplength=620).grid(row=4, column=0, columnspan=4, sticky="w", pady=3)
-    ttk.Label(filter_frame, text="当前分组选“不限”时，会匹配全部账号，包含未分组；如果勾选“仅未分组账号”，则只处理当前未分组账号。", style="Hint.TLabel", justify="left", wraplength=980).grid(row=5, column=0, columnspan=6, sticky="w", pady=(0, 3))
+        ttk.Label(filter_frame, text="指定账号").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=3)
+        account_picker_frame = ttk.Frame(filter_frame)
+        account_picker_frame.grid(row=0, column=1, sticky="ew", pady=3)
+        account_picker_frame.columnconfigure(0, weight=1)
+        account_picker_combo = ttk.Combobox(account_picker_frame, textvariable=account_picker_var, values=[ACCOUNT_PICKER_HINT], state="readonly")
+        account_picker_combo.grid(row=0, column=0, sticky="ew")
+        account_picker_combos.append(account_picker_combo)
+        if account_label_to_id:
+            refresh_account_picker_combo_values()
+        ttk.Label(filter_frame, text="平台").grid(row=0, column=2, sticky="w", padx=(8, 6), pady=3)
+        ttk.Combobox(filter_frame, textvariable=platform_var, values=["(不限)", "openai", "anthropic", "gemini", "antigravity"], state="readonly").grid(row=0, column=3, sticky="ew", pady=3)
+        ttk.Label(filter_frame, text="账号类型").grid(row=0, column=4, sticky="w", padx=(8, 6), pady=3)
+        ttk.Combobox(filter_frame, textvariable=account_type_var, values=["(不限)", "oauth", "apikey", "setup-token", "upstream", "bedrock"], state="readonly").grid(row=0, column=5, sticky="ew", pady=3)
+        ttk.Label(filter_frame, text="账号状态").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=3)
+        ttk.Combobox(filter_frame, textvariable=account_status_var, values=["(不限)", "active", "inactive", "error"], state="readonly").grid(row=1, column=1, sticky="ew", pady=3)
+        ttk.Label(filter_frame, text="搜索关键词").grid(row=1, column=2, sticky="w", padx=(8, 6), pady=3)
+        ttk.Entry(filter_frame, textvariable=search_var).grid(row=1, column=3, sticky="ew", pady=3)
+        ttk.Label(filter_frame, text="名称包含").grid(row=1, column=4, sticky="w", padx=(8, 6), pady=3)
+        ttk.Entry(filter_frame, textvariable=name_contains_var).grid(row=1, column=5, sticky="ew", pady=3)
+        ttk.Label(filter_frame, text="当前分组").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=3)
+        group_filter_combo = ttk.Combobox(filter_frame, textvariable=group_filter_var, values=[GROUP_FILTER_ALL], state="readonly")
+        group_filter_combo.grid(row=2, column=1, sticky="ew", pady=3)
+        group_filter_combos.append(group_filter_combo)
+        if group_label_to_id:
+            refresh_group_combo_values()
+        ttk.Label(filter_frame, text="最多处理数量").grid(row=2, column=2, sticky="w", padx=(8, 6), pady=3)
+        ttk.Entry(filter_frame, textvariable=max_accounts_var).grid(row=2, column=3, sticky="ew", pady=3)
+        ttk.Label(filter_frame, text="每次读取数量").grid(row=2, column=4, sticky="w", padx=(8, 6), pady=3)
+        ttk.Entry(filter_frame, textvariable=page_size_var).grid(row=2, column=5, sticky="ew", pady=3)
+        ttk.Label(filter_frame, text="每次提交数量").grid(row=3, column=0, sticky="w", padx=(0, 6), pady=3)
+        ttk.Entry(filter_frame, textvariable=batch_size_var).grid(row=3, column=1, sticky="ew", pady=3)
+        ttk.Checkbutton(filter_frame, text="仅未分组账号", variable=ungrouped_only_var).grid(row=3, column=2, sticky="w", pady=3)
+        ttk.Checkbutton(filter_frame, text="开始调整前先做预览", variable=dry_run_var).grid(row=3, column=3, sticky="w", pady=3)
+        smart_refresh_btn = ttk.Button(filter_frame, text="同步分组选项", command=lambda: run_action("同步分组", fetch_groups, determinate=True))
+        smart_refresh_btn.grid(row=3, column=5, sticky="e", pady=3)
+        action_buttons.append(smart_refresh_btn)
+        smart_sync_accounts_btn = ttk.Button(filter_frame, text="同步账号列表", command=lambda: run_action("同步账号列表", fetch_accounts, determinate=True))
+        smart_sync_accounts_btn.grid(row=4, column=4, sticky="e", pady=3)
+        action_buttons.append(smart_sync_accounts_btn)
+        smart_sync_proxies_btn = ttk.Button(filter_frame, text="同步代理列表", command=lambda: run_action("同步代理列表", fetch_proxies, determinate=True))
+        smart_sync_proxies_btn.grid(row=4, column=5, sticky="e", pady=3)
+        action_buttons.append(smart_sync_proxies_btn)
+        ttk.Label(filter_frame, textvariable=account_selection_summary_var, style="Hint.TLabel", justify="left", wraplength=620).grid(row=4, column=0, columnspan=4, sticky="w", pady=3)
+        ttk.Label(filter_frame, text="当前分组选“不限”时，会匹配全部账号，包含未分组；如果勾选“仅未分组账号”，则只处理当前未分组账号。", style="Hint.TLabel", justify="left", wraplength=980).grid(row=5, column=0, columnspan=6, sticky="w", pady=(0, 3))
 
-    update_frame = ttk.LabelFrame(tab_bulk_all, text="要修改成什么", padding=8)
-    update_frame.grid(row=3, column=0, sticky="ew", pady=(8, 0))
-    for c in range(4):
-        update_frame.columnconfigure(c, weight=1 if c in (1, 3) else 0)
+        update_frame = ttk.LabelFrame(tab_bulk_all, text="要修改成什么", padding=8)
+        update_frame.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        for c in range(4):
+            update_frame.columnconfigure(c, weight=1 if c in (1, 3) else 0)
 
-    update_group_var = tk.StringVar(value=GROUP_UPDATE_KEEP)
-    update_proxy_var = tk.StringVar(value=PROXY_UPDATE_KEEP)
-    update_status_var = tk.StringVar(value=KEEP_OPTION)
-    update_schedulable_var = tk.StringVar(value=KEEP_OPTION)
-    update_name_var = tk.StringVar()
-    update_notes_var = tk.StringVar()
-    update_notes_mode_var = tk.StringVar(value=KEEP_OPTION)
-    update_type_var = tk.StringVar(value=KEEP_OPTION)
-    update_concurrency_var = tk.StringVar()
-    update_load_factor_mode_var = tk.StringVar(value=KEEP_OPTION)
-    update_load_factor_var = tk.StringVar()
-    update_priority_var = tk.StringVar()
-    update_rate_multiplier_var = tk.StringVar()
-    update_expires_at_mode_var = tk.StringVar(value=KEEP_OPTION)
-    update_expires_at_var = tk.StringVar()
-    update_auto_pause_var = tk.StringVar(value=KEEP_OPTION)
-    confirm_mixed_channel_var = tk.BooleanVar(value=False)
-    advanced_visible_var = tk.BooleanVar(value=False)
-    ttk.Label(update_frame, text="改到分组").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=3)
-    group_update_combo = ttk.Combobox(update_frame, textvariable=update_group_var, values=[GROUP_UPDATE_KEEP, GROUP_UPDATE_CLEAR], state="readonly")
-    group_update_combo.grid(row=0, column=1, sticky="ew", pady=3)
-    group_update_combos.append(group_update_combo)
-    ttk.Label(update_frame, text="代理").grid(row=0, column=2, sticky="w", padx=(8, 6), pady=3)
-    update_proxy_combo = ttk.Combobox(update_frame, textvariable=update_proxy_var, values=[PROXY_UPDATE_KEEP, PROXY_UPDATE_CLEAR], state="readonly")
-    update_proxy_combo.grid(row=0, column=3, sticky="ew", pady=3)
-    proxy_update_combos.append(update_proxy_combo)
-    ttk.Label(update_frame, text="账号状态").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=3)
-    ttk.Combobox(update_frame, textvariable=update_status_var, values=[KEEP_OPTION, "active", "inactive", "error"], state="readonly").grid(row=1, column=1, sticky="ew", pady=3)
-    ttk.Label(update_frame, text="允许调度").grid(row=1, column=2, sticky="w", padx=(8, 6), pady=3)
-    ttk.Combobox(update_frame, textvariable=update_schedulable_var, values=[KEEP_OPTION, ENABLE_OPTION, DISABLE_OPTION], state="readonly").grid(row=1, column=3, sticky="ew", pady=3)
-    ttk.Label(update_frame, text="名称改为").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=3)
-    ttk.Entry(update_frame, textvariable=update_name_var).grid(row=2, column=1, sticky="ew", pady=3)
-    ttk.Label(update_frame, text="备注").grid(row=2, column=2, sticky="w", padx=(8, 6), pady=3)
-    notes_frame = ttk.Frame(update_frame)
-    notes_frame.grid(row=2, column=3, sticky="ew", pady=3)
-    notes_frame.columnconfigure(1, weight=1)
-    ttk.Combobox(notes_frame, textvariable=update_notes_mode_var, values=[KEEP_OPTION, CLEAR_OPTION], state="readonly", width=10).grid(row=0, column=0, sticky="w", padx=(0, 6))
-    ttk.Entry(notes_frame, textvariable=update_notes_var).grid(row=0, column=1, sticky="ew")
-    ttk.Label(update_frame, text="账号类型").grid(row=3, column=0, sticky="w", padx=(0, 6), pady=3)
-    ttk.Combobox(update_frame, textvariable=update_type_var, values=[KEEP_OPTION, "oauth", "apikey", "setup-token", "upstream", "bedrock"], state="readonly").grid(row=3, column=1, sticky="ew", pady=3)
-    ttk.Label(update_frame, text="并发数").grid(row=3, column=2, sticky="w", padx=(8, 6), pady=3)
-    ttk.Entry(update_frame, textvariable=update_concurrency_var).grid(row=3, column=3, sticky="ew", pady=3)
-    ttk.Label(update_frame, text="负载因子").grid(row=4, column=0, sticky="w", padx=(0, 6), pady=3)
-    load_factor_frame = ttk.Frame(update_frame)
-    load_factor_frame.grid(row=4, column=1, sticky="ew", pady=3)
-    load_factor_frame.columnconfigure(1, weight=1)
-    ttk.Combobox(load_factor_frame, textvariable=update_load_factor_mode_var, values=[KEEP_OPTION, CLEAR_OPTION], state="readonly", width=10).grid(row=0, column=0, sticky="w", padx=(0, 6))
-    ttk.Entry(load_factor_frame, textvariable=update_load_factor_var).grid(row=0, column=1, sticky="ew")
-    ttk.Label(update_frame, text="优先级").grid(row=4, column=2, sticky="w", padx=(8, 6), pady=3)
-    ttk.Entry(update_frame, textvariable=update_priority_var).grid(row=4, column=3, sticky="ew", pady=3)
-    ttk.Label(update_frame, text="速率倍率").grid(row=5, column=0, sticky="w", padx=(0, 6), pady=3)
-    ttk.Entry(update_frame, textvariable=update_rate_multiplier_var).grid(row=5, column=1, sticky="ew", pady=3)
-    ttk.Label(update_frame, text="过期时间").grid(row=5, column=2, sticky="w", padx=(8, 6), pady=3)
-    expires_at_frame = ttk.Frame(update_frame)
-    expires_at_frame.grid(row=5, column=3, sticky="ew", pady=3)
-    expires_at_frame.columnconfigure(1, weight=1)
-    ttk.Combobox(expires_at_frame, textvariable=update_expires_at_mode_var, values=[KEEP_OPTION, CLEAR_OPTION], state="readonly", width=10).grid(row=0, column=0, sticky="w", padx=(0, 6))
-    ttk.Entry(expires_at_frame, textvariable=update_expires_at_var).grid(row=0, column=1, sticky="ew")
-    ttk.Label(update_frame, text="到期自动暂停").grid(row=6, column=0, sticky="w", padx=(0, 6), pady=3)
-    ttk.Combobox(update_frame, textvariable=update_auto_pause_var, values=[KEEP_OPTION, ENABLE_OPTION, DISABLE_OPTION], state="readonly").grid(row=6, column=1, sticky="ew", pady=3)
-    ttk.Checkbutton(update_frame, text="确认混合渠道风险（绑定分组时跳过风险拦截）", variable=confirm_mixed_channel_var).grid(row=6, column=2, columnspan=2, sticky="w", pady=3)
+        update_group_var = tk.StringVar(value=GROUP_UPDATE_KEEP)
+        update_proxy_var = tk.StringVar(value=PROXY_UPDATE_KEEP)
+        update_status_var = tk.StringVar(value=KEEP_OPTION)
+        update_schedulable_var = tk.StringVar(value=KEEP_OPTION)
+        update_name_var = tk.StringVar()
+        update_notes_var = tk.StringVar()
+        update_notes_mode_var = tk.StringVar(value=KEEP_OPTION)
+        update_type_var = tk.StringVar(value=KEEP_OPTION)
+        update_concurrency_var = tk.StringVar()
+        update_load_factor_mode_var = tk.StringVar(value=KEEP_OPTION)
+        update_load_factor_var = tk.StringVar()
+        update_priority_var = tk.StringVar()
+        update_rate_multiplier_var = tk.StringVar()
+        update_expires_at_mode_var = tk.StringVar(value=KEEP_OPTION)
+        update_expires_at_var = tk.StringVar()
+        update_auto_pause_var = tk.StringVar(value=KEEP_OPTION)
+        confirm_mixed_channel_var = tk.BooleanVar(value=False)
+        advanced_visible_var = tk.BooleanVar(value=False)
+        ttk.Label(update_frame, text="改到分组").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=3)
+        group_update_combo = ttk.Combobox(update_frame, textvariable=update_group_var, values=[GROUP_UPDATE_KEEP, GROUP_UPDATE_CLEAR], state="readonly")
+        group_update_combo.grid(row=0, column=1, sticky="ew", pady=3)
+        group_update_combos.append(group_update_combo)
+        if group_label_to_id:
+            refresh_group_combo_values()
+        ttk.Label(update_frame, text="代理").grid(row=0, column=2, sticky="w", padx=(8, 6), pady=3)
+        update_proxy_combo = ttk.Combobox(update_frame, textvariable=update_proxy_var, values=[PROXY_UPDATE_KEEP, PROXY_UPDATE_CLEAR], state="readonly")
+        update_proxy_combo.grid(row=0, column=3, sticky="ew", pady=3)
+        proxy_update_combos.append(update_proxy_combo)
+        if proxy_label_to_id:
+            refresh_proxy_widget_values()
+        ttk.Label(update_frame, text="账号状态").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=3)
+        ttk.Combobox(update_frame, textvariable=update_status_var, values=[KEEP_OPTION, "active", "inactive", "error"], state="readonly").grid(row=1, column=1, sticky="ew", pady=3)
+        ttk.Label(update_frame, text="允许调度").grid(row=1, column=2, sticky="w", padx=(8, 6), pady=3)
+        ttk.Combobox(update_frame, textvariable=update_schedulable_var, values=[KEEP_OPTION, ENABLE_OPTION, DISABLE_OPTION], state="readonly").grid(row=1, column=3, sticky="ew", pady=3)
+        ttk.Label(update_frame, text="名称改为").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=3)
+        ttk.Entry(update_frame, textvariable=update_name_var).grid(row=2, column=1, sticky="ew", pady=3)
+        ttk.Label(update_frame, text="备注").grid(row=2, column=2, sticky="w", padx=(8, 6), pady=3)
+        notes_frame = ttk.Frame(update_frame)
+        notes_frame.grid(row=2, column=3, sticky="ew", pady=3)
+        notes_frame.columnconfigure(1, weight=1)
+        ttk.Combobox(notes_frame, textvariable=update_notes_mode_var, values=[KEEP_OPTION, CLEAR_OPTION], state="readonly", width=10).grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Entry(notes_frame, textvariable=update_notes_var).grid(row=0, column=1, sticky="ew")
+        ttk.Label(update_frame, text="账号类型").grid(row=3, column=0, sticky="w", padx=(0, 6), pady=3)
+        ttk.Combobox(update_frame, textvariable=update_type_var, values=[KEEP_OPTION, "oauth", "apikey", "setup-token", "upstream", "bedrock"], state="readonly").grid(row=3, column=1, sticky="ew", pady=3)
+        ttk.Label(update_frame, text="并发数").grid(row=3, column=2, sticky="w", padx=(8, 6), pady=3)
+        ttk.Entry(update_frame, textvariable=update_concurrency_var).grid(row=3, column=3, sticky="ew", pady=3)
+        ttk.Label(update_frame, text="负载因子").grid(row=4, column=0, sticky="w", padx=(0, 6), pady=3)
+        load_factor_frame = ttk.Frame(update_frame)
+        load_factor_frame.grid(row=4, column=1, sticky="ew", pady=3)
+        load_factor_frame.columnconfigure(1, weight=1)
+        ttk.Combobox(load_factor_frame, textvariable=update_load_factor_mode_var, values=[KEEP_OPTION, CLEAR_OPTION], state="readonly", width=10).grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Entry(load_factor_frame, textvariable=update_load_factor_var).grid(row=0, column=1, sticky="ew")
+        ttk.Label(update_frame, text="优先级").grid(row=4, column=2, sticky="w", padx=(8, 6), pady=3)
+        ttk.Entry(update_frame, textvariable=update_priority_var).grid(row=4, column=3, sticky="ew", pady=3)
+        ttk.Label(update_frame, text="速率倍率").grid(row=5, column=0, sticky="w", padx=(0, 6), pady=3)
+        ttk.Entry(update_frame, textvariable=update_rate_multiplier_var).grid(row=5, column=1, sticky="ew", pady=3)
+        ttk.Label(update_frame, text="过期时间").grid(row=5, column=2, sticky="w", padx=(8, 6), pady=3)
+        expires_at_frame = ttk.Frame(update_frame)
+        expires_at_frame.grid(row=5, column=3, sticky="ew", pady=3)
+        expires_at_frame.columnconfigure(1, weight=1)
+        ttk.Combobox(expires_at_frame, textvariable=update_expires_at_mode_var, values=[KEEP_OPTION, CLEAR_OPTION], state="readonly", width=10).grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Entry(expires_at_frame, textvariable=update_expires_at_var).grid(row=0, column=1, sticky="ew")
+        ttk.Label(update_frame, text="到期自动暂停").grid(row=6, column=0, sticky="w", padx=(0, 6), pady=3)
+        ttk.Combobox(update_frame, textvariable=update_auto_pause_var, values=[KEEP_OPTION, ENABLE_OPTION, DISABLE_OPTION], state="readonly").grid(row=6, column=1, sticky="ew", pady=3)
+        ttk.Checkbutton(update_frame, text="确认混合渠道风险（绑定分组时跳过风险拦截）", variable=confirm_mixed_channel_var).grid(row=6, column=2, columnspan=2, sticky="w", pady=3)
 
-    action_frame = ttk.Frame(tab_bulk_all)
-    action_frame.grid(row=4, column=0, sticky="ew", pady=(8, 0))
-    action_frame.columnconfigure(3, weight=1)
+        action_frame = ttk.Frame(tab_bulk_all)
+        action_frame.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        action_frame.columnconfigure(3, weight=1)
 
-    advanced_frame = ttk.LabelFrame(tab_bulk_all, text="高级设置（一般不用填）", padding=8)
-    advanced_frame.grid(row=5, column=0, sticky="nsew", pady=(8, 0))
-    advanced_frame.columnconfigure(0, weight=1)
-    advanced_frame.columnconfigure(1, weight=1)
-    advanced_frame.rowconfigure(1, weight=1)
-    advanced_frame.rowconfigure(3, weight=1)
-    ttk.Label(advanced_frame, text="AI 平台账号信息 JSON").grid(row=0, column=0, sticky="w")
-    ttk.Label(advanced_frame, text="扩展信息 JSON").grid(row=0, column=1, sticky="w")
-    credentials_text = ScrolledText(advanced_frame, height=6)
-    extra_text = ScrolledText(advanced_frame, height=6)
-    credentials_text.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(3, 6))
-    extra_text.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=(3, 6))
-    ttk.Label(advanced_frame, text="底层补充更新 JSON（仅高级用户；会覆盖上面的同名字段）").grid(row=2, column=0, columnspan=2, sticky="w")
-    manual_updates_text = ScrolledText(advanced_frame, height=6)
-    manual_updates_text.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(3, 0))
+        advanced_frame = ttk.LabelFrame(tab_bulk_all, text="高级设置（一般不用填）", padding=8)
+        advanced_frame.grid(row=5, column=0, sticky="nsew", pady=(8, 0))
+        advanced_frame.columnconfigure(0, weight=1)
+        advanced_frame.columnconfigure(1, weight=1)
+        advanced_frame.rowconfigure(1, weight=1)
+        advanced_frame.rowconfigure(3, weight=1)
+        ttk.Label(advanced_frame, text="AI 平台账号信息 JSON").grid(row=0, column=0, sticky="w")
+        ttk.Label(advanced_frame, text="扩展信息 JSON").grid(row=0, column=1, sticky="w")
+        credentials_text = ScrolledText(advanced_frame, height=6)
+        extra_text = ScrolledText(advanced_frame, height=6)
+        credentials_text.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(3, 6))
+        extra_text.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=(3, 6))
+        ttk.Label(advanced_frame, text="底层补充更新 JSON（仅高级用户；会覆盖上面的同名字段）").grid(row=2, column=0, columnspan=2, sticky="w")
+        manual_updates_text = ScrolledText(advanced_frame, height=6)
+        manual_updates_text.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(3, 0))
 
-    def refresh_bulk_advanced_ui() -> None:
-        if advanced_visible_var.get():
-            advanced_frame.grid()
-            toggle_advanced_btn.configure(text="收起高级设置")
-        else:
-            advanced_frame.grid_remove()
-            toggle_advanced_btn.configure(text="展开高级设置")
+        def refresh_bulk_advanced_ui() -> None:
+            if advanced_visible_var.get():
+                advanced_frame.grid()
+                toggle_advanced_btn.configure(text="收起高级设置")
+            else:
+                advanced_frame.grid_remove()
+                toggle_advanced_btn.configure(text="展开高级设置")
 
-    bulk_all_btn = ttk.Button(action_frame, text="开始批量调整", command=lambda: run_action("批量调整账号", bulk_all_action, determinate=True))
-    bulk_all_btn.grid(row=0, column=0, sticky="w")
-    action_buttons.append(bulk_all_btn)
-    preview_bulk_all_btn = ttk.Button(action_frame, text="预览匹配结果", command=lambda: run_action("预览批量调整", preview_bulk_all_action, determinate=True))
-    preview_bulk_all_btn.grid(row=0, column=1, sticky="w", padx=(8, 0))
-    action_buttons.append(preview_bulk_all_btn)
-    toggle_advanced_btn = ttk.Button(action_frame, text="展开高级设置", command=lambda: (advanced_visible_var.set(not advanced_visible_var.get()), refresh_bulk_advanced_ui()))
-    toggle_advanced_btn.grid(row=0, column=2, sticky="w", padx=(8, 0))
-    action_buttons.append(toggle_advanced_btn)
-    ttk.Label(action_frame, text="常用修改只需要上面的筛选条件和修改目标，下面的 JSON 一般可以不碰。", style="Hint.TLabel").grid(row=0, column=3, sticky="e")
-    refresh_bulk_advanced_ui()
+        def normalize_select(value: str) -> str | None:
+            stripped = value.strip()
+            if not stripped or stripped.startswith("("):
+                return None
+            return stripped
 
-    def normalize_select(value: str) -> str | None:
-        stripped = value.strip()
-        if not stripped or stripped.startswith("("):
-            return None
-        return stripped
+        def update_account_selection_summary(*_args: Any) -> None:
+            ids = parse_ids(account_ids_raw_var.get(), "指定账号", required=False) or []
+            if not ids:
+                account_selection_summary_var.set("未指定账号时，会按下面的筛选条件自动匹配。")
+                return
+            labels = [account_id_to_label.get(account_id, f"[{account_id}]") for account_id in ids[:3]]
+            preview = "，".join(labels)
+            if len(ids) > 3:
+                preview += f" 等 {len(ids)} 个账号"
+            account_selection_summary_var.set(f"当前已指定 {len(ids)} 个账号：{preview}")
 
-    def update_account_selection_summary(*_args: Any) -> None:
-        ids = parse_ids(account_ids_raw_var.get(), "指定账号", required=False) or []
-        if not ids:
-            account_selection_summary_var.set("未指定账号时，会按下面的筛选条件自动匹配。")
-            return
-        labels = [account_id_to_label.get(account_id, f"[{account_id}]") for account_id in ids[:3]]
-        preview = "，".join(labels)
-        if len(ids) > 3:
-            preview += f" 等 {len(ids)} 个账号"
-        account_selection_summary_var.set(f"当前已指定 {len(ids)} 个账号：{preview}")
+        def add_bulk_account_from_picker() -> None:
+            label = account_picker_var.get().strip()
+            if not label or label == ACCOUNT_PICKER_HINT:
+                raise CLIError("请先从下拉框里选择一个账号")
+            account_id = account_label_to_id.get(label)
+            if account_id is None:
+                raise CLIError("账号下拉值已过期，请重新同步账号列表")
+            ids = parse_ids(account_ids_raw_var.get(), "指定账号", required=False) or []
+            if account_id not in ids:
+                ids.append(account_id)
+            account_ids_raw_var.set(" ".join(str(item) for item in ids))
 
-    def add_bulk_account_from_picker() -> None:
-        label = account_picker_var.get().strip()
-        if not label or label == ACCOUNT_PICKER_HINT:
-            raise CLIError("请先从下拉框里选择一个账号")
-        account_id = account_label_to_id.get(label)
-        if account_id is None:
-            raise CLIError("账号下拉值已过期，请重新同步账号列表")
-        ids = parse_ids(account_ids_raw_var.get(), "指定账号", required=False) or []
-        if account_id not in ids:
-            ids.append(account_id)
-        account_ids_raw_var.set(" ".join(str(item) for item in ids))
+        def clear_bulk_account_selection() -> None:
+            account_ids_raw_var.set("")
 
-    def clear_bulk_account_selection() -> None:
-        account_ids_raw_var.set("")
+        account_ids_raw_var.trace_add("write", update_account_selection_summary)
+        account_picker_add_btn = ttk.Button(account_picker_frame, text="添加", command=safe_ui_action(add_bulk_account_from_picker))
+        account_picker_add_btn.grid(row=0, column=1, padx=(6, 0))
+        action_buttons.append(account_picker_add_btn)
+        account_picker_clear_btn = ttk.Button(account_picker_frame, text="清空", command=clear_bulk_account_selection)
+        account_picker_clear_btn.grid(row=0, column=2, padx=(6, 0))
+        action_buttons.append(account_picker_clear_btn)
+        update_account_selection_summary()
 
-    account_ids_raw_var.trace_add("write", update_account_selection_summary)
-    account_picker_add_btn = ttk.Button(account_picker_frame, text="添加", command=safe_ui_action(add_bulk_account_from_picker))
-    account_picker_add_btn.grid(row=0, column=1, padx=(6, 0))
-    action_buttons.append(account_picker_add_btn)
-    account_picker_clear_btn = ttk.Button(account_picker_frame, text="清空", command=clear_bulk_account_selection)
-    account_picker_clear_btn.grid(row=0, column=2, padx=(6, 0))
-    action_buttons.append(account_picker_clear_btn)
-    update_account_selection_summary()
+        def selected_group_ids_from_label(value: str, *, allow_none: bool, allow_clear: bool) -> list[int] | None:
+            selected = value.strip()
+            if not selected:
+                return None if allow_none else []
+            if allow_none and selected == GROUP_FILTER_ALL:
+                return None
+            if allow_none and selected == GROUP_UPDATE_KEEP:
+                return None
+            if allow_clear and selected == GROUP_UPDATE_CLEAR:
+                return []
+            group_id = group_label_to_id.get(selected)
+            if group_id is None:
+                raise CLIError("分组下拉值无效，请先点击“同步分组”")
+            return [group_id]
 
-    def selected_group_ids_from_label(value: str, *, allow_none: bool, allow_clear: bool) -> list[int] | None:
-        selected = value.strip()
-        if not selected:
-            return None if allow_none else []
-        if allow_none and selected == GROUP_FILTER_ALL:
-            return None
-        if allow_none and selected == GROUP_UPDATE_KEEP:
-            return None
-        if allow_clear and selected == GROUP_UPDATE_CLEAR:
-            return []
-        group_id = group_label_to_id.get(selected)
-        if group_id is None:
-            raise CLIError("分组下拉值无效，请先点击“同步分组”")
-        return [group_id]
+        def selected_proxy_id_from_label(value: str) -> int | None:
+            selected = value.strip()
+            if not selected or selected == PROXY_UPDATE_KEEP:
+                return None
+            if selected == PROXY_UPDATE_CLEAR:
+                return 0
+            proxy_id = proxy_label_to_id.get(selected)
+            if proxy_id is None:
+                raise CLIError("代理下拉值无效，请先点击“同步代理列表”")
+            return proxy_id
 
-    def selected_proxy_id_from_label(value: str) -> int | None:
-        selected = value.strip()
-        if not selected or selected == PROXY_UPDATE_KEEP:
-            return None
-        if selected == PROXY_UPDATE_CLEAR:
-            return 0
-        proxy_id = proxy_label_to_id.get(selected)
-        if proxy_id is None:
-            raise CLIError("代理下拉值无效，请先点击“同步代理列表”")
-        return proxy_id
+        def preview_bulk_all_action(progress_callback: Callable[[int, int, str], None]) -> Any:
+            original_value = bool(dry_run_var.get())
+            dry_run_var.set(True)
+            try:
+                return bulk_all_action(progress_callback)
+            finally:
+                dry_run_var.set(original_value)
 
-    def preview_bulk_all_action(progress_callback: Callable[[int, int, str], None]) -> Any:
-        original_value = bool(dry_run_var.get())
-        dry_run_var.set(True)
-        try:
-            return bulk_all_action(progress_callback)
-        finally:
-            dry_run_var.set(original_value)
+        def bulk_all_action(progress_callback: Callable[[int, int, str], None]) -> Any:
+            updates: dict[str, Any] = {}
+            target_group_ids = selected_group_ids_from_label(update_group_var.get(), allow_none=True, allow_clear=True)
+            if target_group_ids is not None:
+                updates["group_ids"] = target_group_ids
+            proxy_id = selected_proxy_id_from_label(update_proxy_var.get())
+            if proxy_id is not None:
+                updates["proxy_id"] = proxy_id
+            update_status = normalize_select(update_status_var.get())
+            if update_status:
+                updates["status"] = update_status
+            has_schedulable, schedulable_value = parse_optional_bool_choice(update_schedulable_var.get(), "允许调度")
+            if has_schedulable:
+                updates["schedulable"] = bool(schedulable_value)
+            update_name = non_empty(update_name_var.get())
+            if update_name is not None:
+                updates["name"] = update_name
+            notes_mode = update_notes_mode_var.get().strip()
+            notes_text = update_notes_var.get().strip()
+            if notes_mode == CLEAR_OPTION:
+                updates["notes"] = None
+            elif notes_text:
+                updates["notes"] = notes_text
+            update_type = normalize_select(update_type_var.get())
+            if update_type:
+                updates["type"] = update_type
+            update_concurrency = parse_optional_positive_int(update_concurrency_var.get(), "并发数")
+            if update_concurrency is not None:
+                updates["concurrency"] = update_concurrency
+            load_factor_mode = update_load_factor_mode_var.get().strip()
+            load_factor_raw = update_load_factor_var.get().strip()
+            if load_factor_mode == CLEAR_OPTION:
+                updates["load_factor"] = None
+            elif load_factor_raw:
+                load_factor_value = parse_optional_int(load_factor_raw, "负载因子")
+                if load_factor_value is None:
+                    raise CLIError("负载因子不能为空")
+                updates["load_factor"] = load_factor_value
+            update_priority = parse_optional_int(update_priority_var.get(), "优先级")
+            if update_priority is not None:
+                updates["priority"] = update_priority
+            rate_multiplier = parse_optional_float(update_rate_multiplier_var.get(), "速率倍率", min_value=0.0)
+            if rate_multiplier is not None:
+                updates["rate_multiplier"] = rate_multiplier
+            expires_at_mode = update_expires_at_mode_var.get().strip()
+            expires_at_raw = update_expires_at_var.get().strip()
+            if expires_at_mode == CLEAR_OPTION:
+                updates["expires_at"] = None
+            elif expires_at_raw:
+                updates["expires_at"] = parse_optional_timestamp(expires_at_raw, "过期时间")
+            has_auto_pause, auto_pause_value = parse_optional_bool_choice(update_auto_pause_var.get(), "到期自动暂停")
+            if has_auto_pause:
+                updates["auto_pause_on_expired"] = bool(auto_pause_value)
+            if confirm_mixed_channel_var.get():
+                updates["confirm_mixed_channel_risk"] = True
 
-    def bulk_all_action(progress_callback: Callable[[int, int, str], None]) -> Any:
-        updates: dict[str, Any] = {}
-        target_group_ids = selected_group_ids_from_label(update_group_var.get(), allow_none=True, allow_clear=True)
-        if target_group_ids is not None:
-            updates["group_ids"] = target_group_ids
-        proxy_id = selected_proxy_id_from_label(update_proxy_var.get())
-        if proxy_id is not None:
-            updates["proxy_id"] = proxy_id
-        update_status = normalize_select(update_status_var.get())
-        if update_status:
-            updates["status"] = update_status
-        has_schedulable, schedulable_value = parse_optional_bool_choice(update_schedulable_var.get(), "允许调度")
-        if has_schedulable:
-            updates["schedulable"] = bool(schedulable_value)
-        update_name = non_empty(update_name_var.get())
-        if update_name is not None:
-            updates["name"] = update_name
-        notes_mode = update_notes_mode_var.get().strip()
-        notes_text = update_notes_var.get().strip()
-        if notes_mode == CLEAR_OPTION:
-            updates["notes"] = None
-        elif notes_text:
-            updates["notes"] = notes_text
-        update_type = normalize_select(update_type_var.get())
-        if update_type:
-            updates["type"] = update_type
-        update_concurrency = parse_optional_positive_int(update_concurrency_var.get(), "并发数")
-        if update_concurrency is not None:
-            updates["concurrency"] = update_concurrency
-        load_factor_mode = update_load_factor_mode_var.get().strip()
-        load_factor_raw = update_load_factor_var.get().strip()
-        if load_factor_mode == CLEAR_OPTION:
-            updates["load_factor"] = None
-        elif load_factor_raw:
-            load_factor_value = parse_optional_int(load_factor_raw, "负载因子")
-            if load_factor_value is None:
-                raise CLIError("负载因子不能为空")
-            updates["load_factor"] = load_factor_value
-        update_priority = parse_optional_int(update_priority_var.get(), "优先级")
-        if update_priority is not None:
-            updates["priority"] = update_priority
-        rate_multiplier = parse_optional_float(update_rate_multiplier_var.get(), "速率倍率", min_value=0.0)
-        if rate_multiplier is not None:
-            updates["rate_multiplier"] = rate_multiplier
-        expires_at_mode = update_expires_at_mode_var.get().strip()
-        expires_at_raw = update_expires_at_var.get().strip()
-        if expires_at_mode == CLEAR_OPTION:
-            updates["expires_at"] = None
-        elif expires_at_raw:
-            updates["expires_at"] = parse_optional_timestamp(expires_at_raw, "过期时间")
-        has_auto_pause, auto_pause_value = parse_optional_bool_choice(update_auto_pause_var.get(), "到期自动暂停")
-        if has_auto_pause:
-            updates["auto_pause_on_expired"] = bool(auto_pause_value)
-        if confirm_mixed_channel_var.get():
-            updates["confirm_mixed_channel_risk"] = True
+            credentials_payload = parse_json_text(credentials_text.get("1.0", tk.END), "AI 平台账号信息 JSON", require_dict=True)
+            if credentials_payload is not None:
+                updates["credentials"] = credentials_payload
+            extra_payload = parse_json_text(extra_text.get("1.0", tk.END), "扩展信息 JSON", require_dict=True)
+            if extra_payload is not None:
+                updates["extra"] = extra_payload
+            manual_updates = parse_json_text(manual_updates_text.get("1.0", tk.END), "底层补充更新 JSON", require_dict=True)
+            if manual_updates is not None:
+                updates.update(manual_updates)
 
-        credentials_payload = parse_json_text(credentials_text.get("1.0", tk.END), "AI 平台账号信息 JSON", require_dict=True)
-        if credentials_payload is not None:
-            updates["credentials"] = credentials_payload
-        extra_payload = parse_json_text(extra_text.get("1.0", tk.END), "扩展信息 JSON", require_dict=True)
-        if extra_payload is not None:
-            updates["extra"] = extra_payload
-        manual_updates = parse_json_text(manual_updates_text.get("1.0", tk.END), "底层补充更新 JSON", require_dict=True)
-        if manual_updates is not None:
-            updates.update(manual_updates)
+            if "account_ids" in updates:
+                raise CLIError("更新字段中不允许包含 account_ids")
+            if not updates:
+                raise CLIError("请至少填写一个更新字段")
 
-        if "account_ids" in updates:
-            raise CLIError("更新字段中不允许包含 account_ids")
-        if not updates:
-            raise CLIError("请至少填写一个更新字段")
+            args = argparse.Namespace(
+                updates_file="",
+                updates_payload=updates,
+                account_ids=parse_ids(account_ids_raw_var.get(), "指定账号", required=False),
+                platform=normalize_select(platform_var.get()),
+                account_type=normalize_select(account_type_var.get()),
+                account_status=normalize_select(account_status_var.get()),
+                search=non_empty(search_var.get()),
+                name_contains=non_empty(name_contains_var.get()),
+                group_ids=selected_group_ids_from_label(group_filter_var.get(), allow_none=True, allow_clear=False),
+                ungrouped_only=bool(ungrouped_only_var.get()),
+                max_accounts=parse_optional_positive_int(max_accounts_var.get(), "最多处理数量"),
+                page_size=parse_optional_positive_int(page_size_var.get(), "每次读取数量") or 100,
+                batch_size=parse_optional_positive_int(batch_size_var.get(), "每次提交数量") or 100,
+                dry_run=bool(dry_run_var.get()),
+                progress_callback=progress_callback,
+            )
+            return handle_bulk_update_all_accounts(get_client(), args).payload
 
-        args = argparse.Namespace(
-            updates_file="",
-            updates_payload=updates,
-            account_ids=parse_ids(account_ids_raw_var.get(), "指定账号", required=False),
-            platform=normalize_select(platform_var.get()),
-            account_type=normalize_select(account_type_var.get()),
-            account_status=normalize_select(account_status_var.get()),
-            search=non_empty(search_var.get()),
-            name_contains=non_empty(name_contains_var.get()),
-            group_ids=selected_group_ids_from_label(group_filter_var.get(), allow_none=True, allow_clear=False),
-            ungrouped_only=bool(ungrouped_only_var.get()),
-            max_accounts=parse_optional_positive_int(max_accounts_var.get(), "最多处理数量"),
-            page_size=parse_optional_positive_int(page_size_var.get(), "每次读取数量") or 100,
-            batch_size=parse_optional_positive_int(batch_size_var.get(), "每次提交数量") or 100,
-            dry_run=bool(dry_run_var.get()),
-            progress_callback=progress_callback,
-        )
-        return handle_bulk_update_all_accounts(get_client(), args).payload
+        bulk_all_btn = ttk.Button(action_frame, text="开始批量调整", command=lambda: run_action("批量调整账号", bulk_all_action, determinate=True))
+        bulk_all_btn.grid(row=0, column=0, sticky="w")
+        action_buttons.append(bulk_all_btn)
+        preview_bulk_all_btn = ttk.Button(action_frame, text="预览匹配结果", command=lambda: run_action("预览批量调整", preview_bulk_all_action, determinate=True))
+        preview_bulk_all_btn.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        action_buttons.append(preview_bulk_all_btn)
+        toggle_advanced_btn = ttk.Button(action_frame, text="展开高级设置", command=lambda: (advanced_visible_var.set(not advanced_visible_var.get()), refresh_bulk_advanced_ui()))
+        toggle_advanced_btn.grid(row=0, column=2, sticky="w", padx=(8, 0))
+        action_buttons.append(toggle_advanced_btn)
+        ttk.Label(action_frame, text="常用修改只需要上面的筛选条件和修改目标，下面的 JSON 一般可以不碰。", style="Hint.TLabel").grid(row=0, column=3, sticky="e")
+        refresh_bulk_advanced_ui()
+
+    tab_bulk_all = register_lazy_tab("批量调整账号", build_bulk_all_tab)
 
     # 高级功能
-    tab_api = add_tab("高级功能")
-    method_var = tk.StringVar(value="GET")
-    path_var = tk.StringVar(value="/admin/settings/admin-api-key")
-    no_auth_var = tk.BooleanVar(value=False)
-    ttk.Label(tab_api, text="这里是原始接口调试区，一般情况下不用打开。", style="Title.TLabel").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 4))
-    ttk.Label(
-        tab_api,
-        text="只有当上面的可视化功能不够用时，再手动填写请求方式、接口路径和 JSON 内容。",
-        style="Hint.TLabel",
-        justify="left",
-        wraplength=980,
-    ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 8))
-    ttk.Label(tab_api, text="请求方式").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
-    ttk.Combobox(tab_api, textvariable=method_var, values=["GET", "POST", "PUT", "PATCH", "DELETE"], state="readonly", width=10).grid(row=2, column=1, sticky="w", pady=4)
-    ttk.Label(tab_api, text="接口路径").grid(row=2, column=2, sticky="w", padx=(8, 8), pady=4)
-    ttk.Entry(tab_api, textvariable=path_var).grid(row=2, column=3, sticky="ew", pady=4)
-    tab_api.columnconfigure(3, weight=1)
-    ttk.Checkbutton(tab_api, text="此请求不带鉴权", variable=no_auth_var).grid(row=3, column=3, sticky="w", pady=2)
-    ttk.Label(tab_api, text="JSON 内容（可选）").grid(row=4, column=0, sticky="w", pady=4)
-    request_body = ScrolledText(tab_api, height=10)
-    request_body.grid(row=5, column=0, columnspan=4, sticky="nsew", pady=4)
-    tab_api.rowconfigure(5, weight=1)
+    def build_api_tab(tab_api: ttk.Frame) -> None:
+        method_var = tk.StringVar(value="GET")
+        path_var = tk.StringVar(value="/admin/settings/admin-api-key")
+        no_auth_var = tk.BooleanVar(value=False)
+        ttk.Label(tab_api, text="这里是原始接口调试区，一般情况下不用打开。", style="Title.TLabel").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 4))
+        ttk.Label(
+            tab_api,
+            text="只有当上面的可视化功能不够用时，再手动填写请求方式、接口路径和 JSON 内容。",
+            style="Hint.TLabel",
+            justify="left",
+            wraplength=980,
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        ttk.Label(tab_api, text="请求方式").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Combobox(tab_api, textvariable=method_var, values=["GET", "POST", "PUT", "PATCH", "DELETE"], state="readonly", width=10).grid(row=2, column=1, sticky="w", pady=4)
+        ttk.Label(tab_api, text="接口路径").grid(row=2, column=2, sticky="w", padx=(8, 8), pady=4)
+        ttk.Entry(tab_api, textvariable=path_var).grid(row=2, column=3, sticky="ew", pady=4)
+        tab_api.columnconfigure(3, weight=1)
+        ttk.Checkbutton(tab_api, text="此请求不带鉴权", variable=no_auth_var).grid(row=3, column=3, sticky="w", pady=2)
+        ttk.Label(tab_api, text="JSON 内容（可选）").grid(row=4, column=0, sticky="w", pady=4)
+        request_body = ScrolledText(tab_api, height=10)
+        request_body.grid(row=5, column=0, columnspan=4, sticky="nsew", pady=4)
+        tab_api.rowconfigure(5, weight=1)
 
-    def api_request_action(_progress_callback: Callable[[int, int, str], None]) -> Any:
-        method = method_var.get().strip().upper() or "GET"
-        path = non_empty(path_var.get())
-        if not path:
-            raise CLIError("接口路径不能为空")
-        payload = parse_json_text(request_body.get("1.0", tk.END), "JSON 内容", require_dict=False)
-        client = get_client(require_admin_key=not bool(no_auth_var.get()))
-        return client.request(method, path, payload, auth_required=not bool(no_auth_var.get()))
+        def api_request_action(_progress_callback: Callable[[int, int, str], None]) -> Any:
+            method = method_var.get().strip().upper() or "GET"
+            path = non_empty(path_var.get())
+            if not path:
+                raise CLIError("接口路径不能为空")
+            payload = parse_json_text(request_body.get("1.0", tk.END), "JSON 内容", require_dict=False)
+            client = get_client(require_admin_key=not bool(no_auth_var.get()))
+            return client.request(method, path, payload, auth_required=not bool(no_auth_var.get()))
 
-    api_btn = ttk.Button(tab_api, text="发送高级请求", command=lambda: run_action("高级接口请求", api_request_action))
-    api_btn.grid(row=6, column=0, sticky="w", pady=4)
-    action_buttons.append(api_btn)
+        api_btn = ttk.Button(tab_api, text="发送高级请求", command=lambda: run_action("高级接口请求", api_request_action))
+        api_btn.grid(row=6, column=0, sticky="w", pady=4)
+        action_buttons.append(api_btn)
+
+    tab_api = register_lazy_tab("高级功能", build_api_tab)
 
     def on_close() -> None:
         request_cancel_current_task()
