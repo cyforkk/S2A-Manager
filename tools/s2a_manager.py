@@ -2633,6 +2633,8 @@ def run_admin_gui(
         detection_concurrency = get_configured_detection_concurrency()
         source_mode = detection_usage_source_mode_var.get().strip().lower()
         sync_concurrency = max(get_configured_sync_concurrency(), detection_concurrency)
+        detect_auth = detect_kind in {"auth", "all"}
+        detect_quota = detect_kind in {"quota", "all"}
         client_snapshot = build_client_snapshot()
         get_thread_client = make_thread_local_client_getter(snapshot=client_snapshot)
         sync_client = build_client_from_snapshot(client_snapshot)
@@ -2648,7 +2650,7 @@ def run_admin_gui(
             if not isinstance(account_id, int) or account_id <= 0:
                 return {"account": account, "ok": False, "problem": False, "error": "账号 ID 无效"}
             test_summary = ""
-            usage_source = resolve_account_usage_source(account, source_mode)
+            usage_source = resolve_account_usage_source(account, source_mode) if detect_quota else None
             usage: dict[str, Any] | None = None
             usage_error: str | None = None
             client = get_thread_client()
@@ -2663,41 +2665,41 @@ def run_admin_gui(
             except Exception as exc:
                 test_result = analyze_account_test_result(error_text=str(exc))
 
-            try:
-                usage_result = client.request("GET", build_account_usage_path(account_id, usage_source))
-                if isinstance(usage_result, dict):
-                    usage = usage_result
-                else:
-                    usage_error = "`/usage` 返回格式异常"
-            except Exception as exc:
-                usage_error = str(exc)
+            if detect_quota:
+                try:
+                    usage_result = client.request("GET", build_account_usage_path(account_id, usage_source))
+                    if isinstance(usage_result, dict):
+                        usage = usage_result
+                    else:
+                        usage_error = "`/usage` 返回格式异常"
+                except Exception as exc:
+                    usage_error = str(exc)
 
-            is_401 = account_indicates_reauth(account)
-            is_403 = account_indicates_forbidden(account)
-            is_quota = account_indicates_quota_exhausted(
-                account,
-                five_hour_threshold=five_hour_threshold,
-                seven_day_threshold=seven_day_threshold,
-            )
-            is_401 = is_401 or bool(test_result.get("is_401"))
-            is_403 = is_403 or bool(test_result.get("is_403"))
-            is_quota = is_quota or bool(test_result.get("is_quota"))
-            if isinstance(usage, dict):
-                is_401 = is_401 or usage_indicates_reauth(usage)
-                is_403 = is_403 or usage_indicates_forbidden(usage)
-                is_quota = is_quota or usage_indicates_quota_exhausted(
-                    usage,
+            is_401 = False
+            is_403 = False
+            is_quota = False
+            if detect_auth:
+                is_401 = account_indicates_reauth(account)
+                is_403 = account_indicates_forbidden(account)
+                is_401 = is_401 or bool(test_result.get("is_401"))
+                is_403 = is_403 or bool(test_result.get("is_403"))
+            if detect_quota:
+                is_quota = account_indicates_quota_exhausted(
+                    account,
                     five_hour_threshold=five_hour_threshold,
                     seven_day_threshold=seven_day_threshold,
                 )
-            elif usage_error:
-                lowered_error = usage_error.lower()
-                if "401" in lowered_error or "unauth" in lowered_error or "unauthorized" in lowered_error:
-                    is_401 = True
-                if "403" in lowered_error or "forbidden" in lowered_error:
-                    is_403 = True
-                if "429" in lowered_error or "quota" in lowered_error or "rate limit" in lowered_error:
-                    is_quota = True
+                is_quota = is_quota or bool(test_result.get("is_quota"))
+                if isinstance(usage, dict):
+                    is_quota = is_quota or usage_indicates_quota_exhausted(
+                        usage,
+                        five_hour_threshold=five_hour_threshold,
+                        seven_day_threshold=seven_day_threshold,
+                    )
+                elif usage_error:
+                    lowered_error = usage_error.lower()
+                    if "429" in lowered_error or "quota" in lowered_error or "rate limit" in lowered_error:
+                        is_quota = True
             is_auth_error = is_401 or is_403
             if detect_kind == "auth":
                 problem = is_auth_error
@@ -2705,13 +2707,21 @@ def run_admin_gui(
                 problem = is_quota
             else:
                 problem = is_auth_error or is_quota
-            has_observation = bool(test_result.get("has_success") or test_result.get("has_error") or isinstance(usage, dict))
+            has_observation = bool(
+                test_result.get("has_success")
+                or test_result.get("has_error")
+                or (detect_quota and isinstance(usage, dict))
+            )
             if not problem and not has_observation:
                 return {
                     "account": account,
                     "ok": False,
                     "problem": False,
-                    "error": usage_error or test_summary or "test/usage unavailable",
+                    "error": (
+                        usage_error
+                        if detect_quota and usage_error
+                        else (test_summary or ("test/usage unavailable" if detect_quota else "test unavailable"))
+                    ),
                     "is_401": is_401,
                     "is_403": is_403,
                     "is_auth_error": is_auth_error,
@@ -2750,9 +2760,9 @@ def run_admin_gui(
                         problem_accounts.append(dict(account))
                     account_id = int(account.get("id") or 0)
                     if account_id > 0:
-                        if result.get("is_auth_error"):
+                        if detect_auth and result.get("is_auth_error"):
                             detected_auth_error_ids.append(account_id)
-                        if result.get("is_quota"):
+                        if detect_quota and result.get("is_quota"):
                             detected_quota_ids.append(account_id)
                     if not result.get("ok"):
                         failed_accounts.append(
@@ -2771,16 +2781,26 @@ def run_admin_gui(
 
         synced_auth_errors_result: dict[str, Any] | None = None
         synced_accounts_result: dict[str, Any] | None = None
+        status_sync_error: str | None = None
+        account_sync_error: str | None = None
         if detected_auth_error_ids:
-            synced_auth_errors_result = bulk_mark_accounts_error(
-                detected_auth_error_ids,
-                progress_callback=lambda current, total, message: progress_callback(
-                    len(target_accounts) + current,
-                    len(target_accounts) + max(total, 1),
-                    message,
-                ),
-                client=sync_client,
-            )
+            try:
+                synced_auth_errors_result = bulk_mark_accounts_error(
+                    detected_auth_error_ids,
+                    progress_callback=lambda current, total, message: progress_callback(
+                        len(target_accounts) + current,
+                        len(target_accounts) + max(total, 1),
+                        message,
+                    ),
+                    client=sync_client,
+                )
+            except Exception as exc:
+                status_sync_error = str(exc)
+                progress_callback(
+                    len(target_accounts),
+                    len(target_accounts) + 1,
+                    f"{title}：状态回写失败，已保留检测结果。错误：{status_sync_error}",
+                )
 
         if detected_auth_error_ids or detected_quota_ids:
             sync_prefix = "检测完成"
@@ -2790,12 +2810,20 @@ def run_admin_gui(
                 sync_prefix = "鉴权异常状态回写完成"
             elif detected_quota_ids:
                 sync_prefix = "无额度检测完成"
-            synced_accounts_result = sync_account_cache_after_detection(
-                progress_callback=progress_callback,
-                prefix=sync_prefix,
-                sync_concurrency_override=sync_concurrency,
-                client=sync_client,
-            )
+            try:
+                synced_accounts_result = sync_account_cache_after_detection(
+                    progress_callback=progress_callback,
+                    prefix=sync_prefix,
+                    sync_concurrency_override=sync_concurrency,
+                    client=sync_client,
+                )
+            except Exception as exc:
+                account_sync_error = str(exc)
+                progress_callback(
+                    len(target_accounts),
+                    len(target_accounts) + 1,
+                    f"{title}：同步最新账号状态失败，已保留检测结果。错误：{account_sync_error}",
+                )
 
         problem_accounts.sort(key=lambda item: int(item.get("id") or 0))
         invalid_401_account_ids_cache = unique_ids(detected_auth_error_ids)
@@ -2830,6 +2858,8 @@ def run_admin_gui(
             "status_synced_auth_count": parse_int_field((synced_auth_errors_result or {}).get("updated_count"), 0),
             "status_sync_failed_count": parse_int_field((synced_auth_errors_result or {}).get("failed_count"), 0),
             "synced_account_count": parse_int_field((synced_accounts_result or {}).get("account_count"), 0),
+            "status_sync_error": status_sync_error,
+            "account_sync_error": account_sync_error,
         }
 
     def refresh_detection_account_states(progress_callback: Callable[[int, int, str], None]) -> dict[str, Any]:
