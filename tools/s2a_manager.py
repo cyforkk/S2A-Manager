@@ -26,7 +26,7 @@ def get_runtime_base_dir() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def load_app_version(default: str = "v0.1.0") -> str:
+def load_app_version(default: str = "v0.2.0") -> str:
     candidates = [
         get_runtime_base_dir() / "VERSION",
         Path(sys.executable).resolve().parent / "VERSION" if getattr(sys, "frozen", False) else None,
@@ -51,7 +51,7 @@ def load_app_version(default: str = "v0.1.0") -> str:
 
 DEFAULT_BASE_URL = os.environ.get("SUB2API_BASE_URL", "http://127.0.0.1:8080")
 APP_NAME = "S2A Manager"
-APP_VERSION = load_app_version("v0.1.0")
+APP_VERSION = load_app_version("v0.2.0")
 APP_GITHUB_REPO = "GALIAIS/S2A-Manager"
 APP_RELEASES_URL = f"https://github.com/{APP_GITHUB_REPO}/releases"
 APP_LATEST_RELEASE_API = f"https://api.github.com/repos/{APP_GITHUB_REPO}/releases/latest"
