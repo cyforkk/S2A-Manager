@@ -3341,92 +3341,10 @@ def run_admin_gui(
     sync_btn.grid(row=2, column=3, sticky="w", padx=(8, 0))
     action_buttons.append(sync_btn)
 
-    # 运行设置
-    tab_runtime_settings = add_tab("运行设置", scrollable=False)
-    tab_runtime_settings.columnconfigure(1, weight=1)
-    ttk.Label(
-        tab_runtime_settings,
-        text="这里仅保留 0.1.104 和当前桌面工具直接相关的少量设置：Claude Code 最低/最高版本限制，以及是否允许未分组 Key 调度。",
-        style="Title.TLabel",
-        justify="left",
-        wraplength=980,
-    ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
-    ttk.Label(
-        tab_runtime_settings,
-        text="版本号留空表示不限制，格式示例：2.1.63。保存后会直接写回网站的 /admin/settings。",
-        style="Hint.TLabel",
-        justify="left",
-        wraplength=980,
-    ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 10))
-
-    min_claude_code_version_var = tk.StringVar()
-    max_claude_code_version_var = tk.StringVar()
-    allow_ungrouped_key_scheduling_var = tk.BooleanVar(value=False)
-
-    ttk.Label(tab_runtime_settings, text="最低 Claude Code 版本").grid(row=2, column=0, sticky="w", pady=3)
-    ttk.Entry(tab_runtime_settings, textvariable=min_claude_code_version_var).grid(row=2, column=1, sticky="ew", pady=3)
-    ttk.Label(tab_runtime_settings, text="最高 Claude Code 版本").grid(row=3, column=0, sticky="w", pady=3)
-    ttk.Entry(tab_runtime_settings, textvariable=max_claude_code_version_var).grid(row=3, column=1, sticky="ew", pady=3)
-    ttk.Checkbutton(
-        tab_runtime_settings,
-        text="允许未分组 Key 调度（关闭时未分组 Key 默认返回 403）",
-        variable=allow_ungrouped_key_scheduling_var,
-    ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 3))
-
-    def normalize_optional_semver_input(value: str, label: str) -> str:
-        text = value.strip()
-        if not text:
-            return ""
-        if not re.fullmatch(r"\d+\.\d+\.\d+", text):
-            raise CLIError(f"{label} 必须是 semver 版本号，例如 2.1.63；留空表示不限制")
-        return text
-
-    def apply_runtime_settings(payload: dict[str, Any]) -> None:
-        min_claude_code_version_var.set(str(payload.get("min_claude_code_version") or "").strip())
-        max_claude_code_version_var.set(str(payload.get("max_claude_code_version") or "").strip())
-        allow_ungrouped_key_scheduling_var.set(bool(payload.get("allow_ungrouped_key_scheduling")))
-
-    def load_runtime_settings_action(_progress_callback: Callable[[int, int, str], None]) -> Any:
-        payload = get_client().request("GET", "/admin/settings")
-        if not isinstance(payload, dict):
-            raise CLIError("`/admin/settings` 返回格式异常：期望对象")
-        safe_after(0, lambda data=dict(payload): apply_runtime_settings(data))
-        return {
-            "min_claude_code_version": str(payload.get("min_claude_code_version") or "").strip(),
-            "max_claude_code_version": str(payload.get("max_claude_code_version") or "").strip(),
-            "allow_ungrouped_key_scheduling": bool(payload.get("allow_ungrouped_key_scheduling")),
-        }
-
-    def save_runtime_settings_action(_progress_callback: Callable[[int, int, str], None]) -> Any:
-        min_version = normalize_optional_semver_input(min_claude_code_version_var.get(), "最低 Claude Code 版本")
-        max_version = normalize_optional_semver_input(max_claude_code_version_var.get(), "最高 Claude Code 版本")
-        if min_version and max_version and normalize_version_tag(max_version) < normalize_version_tag(min_version):
-            raise CLIError("最高 Claude Code 版本不能小于最低 Claude Code 版本")
-        payload = {
-            "min_claude_code_version": min_version,
-            "max_claude_code_version": max_version,
-            "allow_ungrouped_key_scheduling": bool(allow_ungrouped_key_scheduling_var.get()),
-        }
-        return get_client().request("PUT", "/admin/settings", payload)
-
-    runtime_settings_load_btn = ttk.Button(tab_runtime_settings, text="读取当前设置", command=lambda: run_action("读取运行设置", load_runtime_settings_action))
-    runtime_settings_load_btn.grid(row=5, column=0, sticky="w", pady=(8, 0))
-    action_buttons.append(runtime_settings_load_btn)
-    runtime_settings_save_btn = ttk.Button(tab_runtime_settings, text="保存到网站", command=lambda: run_action("保存运行设置", save_runtime_settings_action))
-    runtime_settings_save_btn.grid(row=5, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
-    action_buttons.append(runtime_settings_save_btn)
-
     # 账号检测
     tab_delete_accounts = add_tab("账号检测", scrollable=False)
     tab_delete_accounts.columnconfigure(0, weight=1)
     tab_delete_accounts.rowconfigure(8, weight=1)
-    ttk.Label(
-        tab_delete_accounts,
-        text="先同步账号列表，再按当前分组范围检测 401/403 鉴权异常和无额度账号。检测会优先执行 /test 刷新运行时状态，再按所选用量来源补充读取 /usage；Anthropic OAuth/SetupToken 默认走被动采样，命中后会同步状态并可直接载入列表。",
-        style="Title.TLabel",
-        justify="left",
-        wraplength=980,
-    ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 4))
 
     delete_group_var = tk.StringVar(value=GROUP_FILTER_ALL)
     detect_five_hour_threshold_var = tk.StringVar(value="99")
