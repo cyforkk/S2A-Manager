@@ -3571,11 +3571,30 @@ def run_admin_gui(
     detection_usage_source_mode_var = tk.StringVar(value="自动（Anthropic 被动，其它主动）")
 
     def sync_detection_accounts_and_groups(progress_callback: Callable[[int, int, str], None]) -> Any:
-        progress_callback(0, 2, "开始同步账号和分组：1/2 正在同步分组...")
-        groups_result = fetch_groups()
-        progress_callback(1, 2, f"开始同步账号和分组：1/2 分组完成，共 {groups_result.get('group_count', 0)} 个；正在同步账号...")
-        accounts_result = fetch_accounts()
-        progress_callback(2, 2, f"账号和分组同步完成：分组 {groups_result.get('group_count', 0)} 个，账号 {accounts_result.get('account_count', 0)} 个")
+        def group_progress(current: int, total: int, message: str) -> None:
+            progress_callback(min(max(current, 0), 1), 2, message)
+
+        groups_result = fetch_groups(progress_callback=group_progress)
+        account_progress_total = 2
+
+        def account_progress(current: int, total: int, message: str) -> None:
+            nonlocal account_progress_total
+            safe_total = max(total, 1)
+            adjusted_total = 1 + safe_total
+            account_progress_total = adjusted_total
+            adjusted_current = min(1 + max(current, 0), adjusted_total)
+            progress_callback(
+                adjusted_current,
+                adjusted_total,
+                f"同步账号和分组：{message}",
+            )
+
+        accounts_result = fetch_accounts(progress_callback=account_progress)
+        progress_callback(
+            account_progress_total,
+            account_progress_total,
+            f"账号和分组同步完成：分组 {groups_result.get('group_count', 0)} 个，账号 {accounts_result.get('account_count', 0)} 个",
+        )
         return {
             "groups": groups_result.get("group_count", 0),
             "accounts": accounts_result.get("account_count", 0),
