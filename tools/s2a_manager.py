@@ -2898,6 +2898,7 @@ def run_admin_gui(
             labels.append(label)
             if account_id > 0:
                 detection_label_to_account_id[label] = account_id
+        update_detection_count_widgets()
 
         return {
             "scope_account_count": len(target_accounts),
@@ -3281,6 +3282,7 @@ def run_admin_gui(
         detection_label_to_account_id = {}
         invalid_401_account_ids_cache = []
         invalid_quota_account_ids_cache = []
+        update_detection_count_widgets()
 
     def apply_accounts_to_combos(accounts: list[dict[str, Any]], *, preserve_detection_results: bool = False) -> None:
         nonlocal accounts_cache, account_label_to_id, account_id_to_label, detection_label_to_account_id, invalid_401_account_ids_cache, invalid_quota_account_ids_cache
@@ -3300,6 +3302,7 @@ def run_admin_gui(
             labels.append(label)
             account_label_to_id[label] = account_id
             account_id_to_label[account_id] = label
+        update_detection_count_widgets()
 
         refresh_account_picker_combo_values()
 
@@ -3663,6 +3666,20 @@ def run_admin_gui(
     detect_five_hour_threshold_var = tk.StringVar(value="99")
     detect_seven_day_threshold_var = tk.StringVar(value="99")
     detection_usage_source_mode_var = tk.StringVar(value="自动（Anthropic 被动，其它主动）")
+    detect_401_count_var = tk.StringVar(value="命中 0")
+    detect_quota_count_var = tk.StringVar(value="命中 0")
+    delete_accounts_summary_var = tk.StringVar(value="401/403: 0   无额度: 0   合计: 0   已选: 0")
+
+    def update_detection_count_widgets() -> None:
+        auth_count = len(unique_ids(invalid_401_account_ids_cache))
+        quota_count = len(unique_ids(invalid_quota_account_ids_cache))
+        total_count = len(unique_ids([*invalid_401_account_ids_cache, *invalid_quota_account_ids_cache]))
+        selected_count = len(delete_accounts_listbox.curselection()) if "delete_accounts_listbox" in locals() else 0
+        detect_401_count_var.set(f"命中 {auth_count}")
+        detect_quota_count_var.set(f"命中 {quota_count}")
+        delete_accounts_summary_var.set(
+            f"401/403: {auth_count}   无额度: {quota_count}   合计: {total_count}   已选: {selected_count}"
+        )
 
     def sync_detection_accounts_and_groups(progress_callback: Callable[[int, int, str], None]) -> Any:
         def group_progress(current: int, total: int, message: str) -> None:
@@ -3712,6 +3729,7 @@ def run_admin_gui(
         if not labels:
             raise CLIError("当前范围下没有账号")
         set_listbox_items(delete_accounts_listbox, labels)
+        update_detection_count_widgets()
 
     delete_sync_accounts_btn = ttk.Button(tab_delete_accounts, text="同步账号和分组", command=lambda: run_action("同步账号和分组", sync_detection_accounts_and_groups, determinate=True))
     delete_sync_accounts_btn.grid(in_=detection_scope_frame, row=0, column=2, sticky="w")
@@ -3786,6 +3804,7 @@ def run_admin_gui(
         if not labels:
             raise CLIError("检测结果对应的账号已失效，请重新同步账号和分组后再检测")
         set_listbox_items(delete_accounts_listbox, labels)
+        update_detection_count_widgets()
 
     def load_all_detected_accounts() -> None:
         combined_ids = unique_ids([*invalid_401_account_ids_cache, *invalid_quota_account_ids_cache])
@@ -3808,6 +3827,7 @@ def run_admin_gui(
         if not labels:
             raise CLIError("检测结果对应的账号已失效，请重新同步账号和分组后再检测")
         set_listbox_items(delete_accounts_listbox, labels)
+        update_detection_count_widgets()
 
     def delete_accounts_with_progress(
         account_ids: list[int],
@@ -3909,9 +3929,11 @@ def run_admin_gui(
     detect_401_btn = ttk.Button(tab_delete_accounts, text="检测 401/403", command=lambda: run_action("检测 401/403", detect_401_accounts_action, determinate=True))
     detect_401_btn.grid(row=4, column=0, sticky="w", pady=4)
     action_buttons.append(detect_401_btn)
+    ttk.Label(tab_delete_accounts, textvariable=detect_401_count_var).grid(row=4, column=0, sticky="w", padx=(112, 0), pady=4)
     detect_quota_btn = ttk.Button(tab_delete_accounts, text="检测无额度", command=lambda: run_action("检测无额度", detect_quota_accounts_action, determinate=True))
     detect_quota_btn.grid(row=4, column=1, sticky="w", pady=4)
     action_buttons.append(detect_quota_btn)
+    ttk.Label(tab_delete_accounts, textvariable=detect_quota_count_var).grid(row=4, column=1, sticky="w", padx=(104, 0), pady=4)
     detect_all_btn = ttk.Button(tab_delete_accounts, text="完整检测", command=lambda: run_action("完整检测", detect_all_accounts_action, determinate=True))
     detect_all_btn.grid(row=4, column=2, sticky="w", pady=4)
     action_buttons.append(detect_all_btn)
@@ -3947,10 +3969,19 @@ def run_admin_gui(
     delete_accounts_scrollbar = ttk.Scrollbar(delete_accounts_list_frame, orient="vertical", command=delete_accounts_listbox.yview)
     delete_accounts_scrollbar.grid(row=0, column=1, sticky="ns")
     delete_accounts_listbox.configure(yscrollcommand=delete_accounts_scrollbar.set)
+    delete_accounts_listbox.bind("<<ListboxSelect>>", lambda _event: update_detection_count_widgets())
 
-    ttk.Label(tab_delete_accounts, text="待删除账号列表").grid(row=7, column=0, sticky="w", pady=(8, 2))
-    delete_account_clear_btn = ttk.Button(tab_delete_accounts, text="清空列表", command=lambda: set_listbox_items(delete_accounts_listbox, []))
-    delete_account_clear_btn.grid(row=7, column=1, sticky="w", pady=(8, 2))
+    delete_accounts_header_frame = ttk.Frame(tab_delete_accounts)
+    delete_accounts_header_frame.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(8, 2))
+    delete_accounts_header_frame.columnconfigure(1, weight=1)
+    ttk.Label(delete_accounts_header_frame, text="待删除账号列表", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(delete_accounts_header_frame, textvariable=delete_accounts_summary_var).grid(row=0, column=1, sticky="w", padx=(12, 0))
+    delete_account_clear_btn = ttk.Button(
+        delete_accounts_header_frame,
+        text="清空列表",
+        command=lambda: (set_listbox_items(delete_accounts_listbox, []), update_detection_count_widgets()),
+    )
+    delete_account_clear_btn.grid(row=0, column=2, sticky="e")
     action_buttons.append(delete_account_clear_btn)
 
     def run_delete_accounts_selected() -> None:
@@ -3977,6 +4008,7 @@ def run_admin_gui(
     delete_accounts_btn = ttk.Button(tab_delete_accounts, text="删除当前列表中的账号", command=safe_ui_action(run_delete_accounts_selected))
     delete_accounts_btn.grid(row=9, column=0, sticky="w", pady=8)
     action_buttons.append(delete_accounts_btn)
+    update_detection_count_widgets()
 
     # 删除代理
     tab_delete_proxies = add_tab("删除代理", scrollable=False)
