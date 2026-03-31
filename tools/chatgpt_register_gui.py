@@ -89,6 +89,10 @@ def build_chatgpt_register_tab(
     register_config_path_var = tk.StringVar(value="")
     register_runtime_hint_var = tk.StringVar(value="")
     register_secret_entries: list[Any] = []
+    register_mail_section_visible_var = tk.BooleanVar(value=True)
+    register_retry_section_visible_var = tk.BooleanVar(value=True)
+    register_oauth_section_visible_var = tk.BooleanVar(value=True)
+    register_advanced_collapsed_var = tk.BooleanVar(value=False)
 
     def raise_cli_error(message: str) -> None:
         raise cli_error_cls(message)
@@ -185,6 +189,12 @@ def build_chatgpt_register_tab(
     ttk.Combobox(runtime_frame, textvariable=register_mail_provider_var, values=["tempmail", "mailtm", "tempmail,mailtm", "mailtm,tempmail"], state="readonly").grid(row=2, column=3, sticky="ew", pady=3)
     ttk.Checkbutton(runtime_frame, text="启用 OAuth", variable=register_enable_oauth_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=3)
     ttk.Checkbutton(runtime_frame, text="强制要求拿到 OAuth Token", variable=register_oauth_required_var).grid(row=3, column=2, columnspan=2, sticky="w", pady=3)
+    section_toggle_frame = ttk.Frame(runtime_frame)
+    section_toggle_frame.grid(row=4, column=0, columnspan=4, sticky="w", pady=(4, 0))
+    ttk.Checkbutton(section_toggle_frame, text="显示邮箱与域名字段", variable=register_mail_section_visible_var).grid(row=0, column=0, sticky="w")
+    ttk.Checkbutton(section_toggle_frame, text="显示网络与调试字段", variable=register_retry_section_visible_var).grid(row=0, column=1, sticky="w", padx=(10, 0))
+    ttk.Checkbutton(section_toggle_frame, text="显示 OAuth 字段", variable=register_oauth_section_visible_var).grid(row=0, column=2, sticky="w", padx=(10, 0))
+    ttk.Checkbutton(section_toggle_frame, text="收起高级配置（网络+OAuth）", variable=register_advanced_collapsed_var).grid(row=0, column=3, sticky="w", padx=(10, 0))
 
     mail_frame = ttk.LabelFrame(tab_register, text="邮箱与域名", padding=8)
     mail_frame.grid(row=4, column=0, sticky="ew", pady=(8, 0))
@@ -276,7 +286,7 @@ def build_chatgpt_register_tab(
 
     action_frame = ttk.Frame(tab_register)
     action_frame.grid(row=8, column=0, sticky="ew", pady=(8, 0))
-    action_frame.columnconfigure(5, weight=1)
+    action_frame.columnconfigure(6, weight=1)
 
     preview_frame = ttk.LabelFrame(tab_register, text="当前原始配置预览", padding=8)
     preview_frame.grid(row=9, column=0, sticky="ew", pady=(8, 0))
@@ -285,6 +295,24 @@ def build_chatgpt_register_tab(
     register_preview = ScrolledText(preview_frame, height=14, wrap="word")
     register_preview.grid(row=1, column=0, sticky="ew")
     set_register_preview_text(register_preview, "尚未读取注册机配置。")
+
+    def refresh_section_visibility() -> None:
+        if register_mail_section_visible_var.get():
+            mail_frame.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        else:
+            mail_frame.grid_remove()
+
+        retry_visible = register_retry_section_visible_var.get() and not register_advanced_collapsed_var.get()
+        if retry_visible:
+            retry_frame.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        else:
+            retry_frame.grid_remove()
+
+        oauth_visible = register_oauth_section_visible_var.get() and not register_advanced_collapsed_var.get()
+        if oauth_visible:
+            oauth_frame.grid(row=6, column=0, sticky="ew", pady=(8, 0))
+        else:
+            oauth_frame.grid_remove()
 
     def refresh_register_preview(config: dict[str, Any], register_root: Path) -> None:
         config_path = register_root / "config.json"
@@ -324,6 +352,67 @@ def build_chatgpt_register_tab(
             f"输出 {config.get('output_file', '') or 'registered_accounts.txt'}"
         )
         refresh_register_runtime_hint()
+
+    def apply_register_defaults() -> None:
+        register_total_var.set("1")
+        register_workers_var.set("1")
+        register_output_var.set("registered_accounts.txt")
+        register_token_dir_var.set("codex_tokens")
+        register_proxy_var.set("")
+        register_mail_provider_var.set("tempmail")
+        register_enable_oauth_var.set(True)
+        register_oauth_required_var.set(True)
+
+        register_mail_tm_base_url_var.set("https://api.mail.tm")
+        register_mail_tm_domain_index_var.set("0")
+        register_mail_tm_password_var.set("")
+        register_temp_mail_base_url_var.set("")
+        register_temp_mail_admin_auth_var.set("")
+        register_temp_mail_custom_auth_var.set("")
+        register_temp_mail_domain_var.set("")
+        register_temp_mail_domain_index_var.set("0")
+        register_temp_mail_domain_state_file_var.set("temp_mail_domain_state.json")
+        register_temp_mail_enable_prefix_var.set(True)
+        register_temp_mail_name_length_var.set("9")
+        register_temp_mail_name_prefix_var.set("")
+        register_temp_mail_fetch_limit_var.set("10")
+        register_proxy_rotation_var.set(True)
+        register_strategy_var.set("protocol_full")
+        register_codex_entry_url_var.set("https://chatgpt.com/codex")
+        register_protocol_trace_var.set(True)
+        register_protocol_trace_dir_var.set("protocol_traces")
+        register_max_retries_var.set("3")
+        register_retry_delay_var.set("2")
+        register_network_retry_count_var.set("2")
+        register_network_retry_delay_var.set("1.0")
+
+        register_oauth_issuer_var.set("https://auth.openai.com")
+        register_oauth_client_id_var.set("app_EMoamEEZ73f0CkXaXp7hrann")
+        register_oauth_redirect_uri_var.set("http://localhost:1455/auth/callback")
+        register_ak_file_var.set("ak.txt")
+        register_rk_file_var.set("rk.txt")
+        register_sub2api_base_url_var.set("")
+        register_sub2api_admin_api_key_var.set("")
+        register_group_name_var.set("Codex")
+
+        register_mail_section_visible_var.set(True)
+        register_retry_section_visible_var.set(True)
+        register_oauth_section_visible_var.set(True)
+        register_advanced_collapsed_var.set(False)
+        set_multiline_text(temp_mail_domains_text, [])
+        set_multiline_text(blocked_domains_text, [])
+        set_multiline_text(proxy_list_text, [])
+        register_summary_var.set("已恢复默认值，请按需修改后保存。")
+        register_config_path_var.set("")
+        set_register_preview_text(register_preview, "默认值已填充（尚未保存到 config.json）。")
+        refresh_section_visibility()
+        refresh_register_runtime_hint()
+        update_secret_visibility()
+
+    def reset_register_defaults_action() -> None:
+        if not messagebox.askyesno("恢复默认值", "确认将注册机表单恢复为默认值吗？\\n（不会自动写入文件）"):
+            return
+        apply_register_defaults()
 
     def load_register_config_to_form(*, show_message: bool = False, silent: bool = False) -> Path | None:
         if not register_root_var.get().strip():
@@ -389,6 +478,7 @@ def build_chatgpt_register_tab(
         set_multiline_text(blocked_domains_text, [str(item).strip() for item in (config.get("blocked_domains") or []) if str(item).strip()])
         set_multiline_text(proxy_list_text, [str(item).strip() for item in (config.get("proxy_list") or []) if str(item).strip()])
         refresh_register_preview(config, register_root)
+        refresh_section_visibility()
         update_secret_visibility()
         if show_message:
             messagebox.showinfo("读取完成", f"已读取：\n{register_root / 'config.json'}")
@@ -529,14 +619,17 @@ def build_chatgpt_register_tab(
     run_register_btn = ttk.Button(action_frame, text="开始注册", command=lambda: run_action("注册机", run_register_action, determinate=True))
     run_register_btn.grid(row=0, column=2, sticky="w", padx=(8, 0))
     action_buttons.append(run_register_btn)
+    reset_register_btn = ttk.Button(action_frame, text="恢复默认值", command=safe_ui_action(reset_register_defaults_action))
+    reset_register_btn.grid(row=0, column=3, sticky="w", padx=(8, 0))
+    action_buttons.append(reset_register_btn)
     open_config_btn = ttk.Button(action_frame, text="打开 config.json", command=safe_ui_action(lambda: open_local_path(resolve_register_path("config.json", "config.json"))))
-    open_config_btn.grid(row=0, column=3, sticky="w", padx=(8, 0))
+    open_config_btn.grid(row=0, column=4, sticky="w", padx=(8, 0))
     action_buttons.append(open_config_btn)
     open_tokens_btn = ttk.Button(action_frame, text="打开 Token 目录", command=safe_ui_action(open_register_token_dir))
-    open_tokens_btn.grid(row=0, column=4, sticky="w", padx=(8, 0))
+    open_tokens_btn.grid(row=0, column=5, sticky="w", padx=(8, 0))
     action_buttons.append(open_tokens_btn)
     open_output_btn = ttk.Button(action_frame, text="打开输出目录", command=safe_ui_action(open_register_output_dir))
-    open_output_btn.grid(row=0, column=5, sticky="w", padx=(8, 0))
+    open_output_btn.grid(row=0, column=6, sticky="w", padx=(8, 0))
     action_buttons.append(open_output_btn)
 
     base_url_var.trace_add("write", lambda *_args: refresh_register_runtime_hint())
@@ -544,7 +637,12 @@ def build_chatgpt_register_tab(
     register_sync_site_var.trace_add("write", lambda *_args: refresh_register_runtime_hint())
     register_sub2api_base_url_var.trace_add("write", lambda *_args: refresh_register_runtime_hint())
     register_sub2api_admin_api_key_var.trace_add("write", lambda *_args: refresh_register_runtime_hint())
+    register_mail_section_visible_var.trace_add("write", lambda *_args: refresh_section_visibility())
+    register_retry_section_visible_var.trace_add("write", lambda *_args: refresh_section_visibility())
+    register_oauth_section_visible_var.trace_add("write", lambda *_args: refresh_section_visibility())
+    register_advanced_collapsed_var.trace_add("write", lambda *_args: refresh_section_visibility())
 
     load_register_config_to_form(silent=True)
+    refresh_section_visibility()
     update_secret_visibility()
     refresh_register_runtime_hint()
