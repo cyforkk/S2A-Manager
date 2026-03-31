@@ -18,6 +18,17 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urljoin
 from urllib.request import Request, urlopen
 
+from chatgpt_register_adapter import (
+    ChatGPTRegisterAdapterError,
+    ChatGPTRegisterCancelled,
+    build_common_register_updates,
+    find_default_chatgpt_register_root,
+    load_chatgpt_register_config,
+    normalize_chatgpt_register_root,
+    run_chatgpt_register_job,
+    save_chatgpt_register_config,
+)
+
 
 def get_runtime_base_dir() -> Path:
     meipass = getattr(sys, "_MEIPASS", "")
@@ -209,6 +220,7 @@ class GUIConfig:
     delete_concurrency: int = DEFAULT_DELETE_CONCURRENCY
     bulk_page_size: int = 100
     bulk_batch_size: int = 100
+    chatgpt_register_root: str = ""
     window_width: int | None = None
     window_height: int | None = None
 
@@ -295,6 +307,8 @@ def load_gui_config(*, default_base_url: str, default_admin_api_key: str) -> GUI
     saved_bulk_batch_size = coerce_optional_positive_int(raw.get("bulk_batch_size"))
     if saved_bulk_batch_size is not None:
         config.bulk_batch_size = saved_bulk_batch_size
+    if "chatgpt_register_root" in raw and isinstance(raw.get("chatgpt_register_root"), str):
+        config.chatgpt_register_root = raw["chatgpt_register_root"].strip()
     config.window_width = coerce_optional_positive_int(raw.get("window_width"))
     config.window_height = coerce_optional_positive_int(raw.get("window_height"))
     return config
@@ -1728,6 +1742,8 @@ def run_admin_gui(
     delete_concurrency_var = tk.StringVar(value=str(clamp_delete_concurrency(saved_config.delete_concurrency)))
     page_size_var = tk.StringVar(value=str(saved_config.bulk_page_size))
     batch_size_var = tk.StringVar(value=str(saved_config.bulk_batch_size))
+    default_register_root = find_default_chatgpt_register_root()
+    register_root_var = tk.StringVar(value=saved_config.chatgpt_register_root or (str(default_register_root) if default_register_root else ""))
     sync_concurrency_frame = ttk.Frame(top)
     sync_concurrency_frame.grid(row=0, column=2, columnspan=2, sticky="w", padx=(12, 0), pady=2)
     ttk.Label(sync_concurrency_frame, text="同步并发数").grid(row=0, column=0, sticky="w")
@@ -1805,6 +1821,15 @@ def run_admin_gui(
         path = filedialog.askdirectory(title="选择包含 JSON 文件的目录")
         if path:
             target_var.set(path)
+
+    def open_local_path(path_value: str | Path) -> None:
+        target = Path(path_value).expanduser()
+        if not target.exists():
+            raise CLIError(f"路径不存在：{target}")
+        if hasattr(os, "startfile"):
+            os.startfile(str(target))
+            return
+        raise CLIError("当前系统不支持直接打开本地路径")
 
     def collect_json_input_files(mode: str, source_path: str | None, *, recursive: bool, purpose_label: str) -> tuple[Path, list[Path]]:
         if not source_path:
@@ -3085,6 +3110,7 @@ def run_admin_gui(
             delete_concurrency=clamp_delete_concurrency(parse_optional_positive_int(delete_concurrency_var.get(), "删除并发数") or DEFAULT_DELETE_CONCURRENCY),
             bulk_page_size=clamp_admin_list_page_size(parse_optional_positive_int(page_size_var.get(), "每次读取数量") or 100),
             bulk_batch_size=parse_optional_positive_int(batch_size_var.get(), "每次提交数量") or 100,
+            chatgpt_register_root=register_root_var.get().strip(),
             window_width=width,
             window_height=height,
         )
@@ -3656,6 +3682,272 @@ def run_admin_gui(
     sync_btn = ttk.Button(tab_test, text="3. 同步数据", command=lambda: run_action("同步数据", sync_reference_data, determinate=True))
     sync_btn.grid(row=2, column=3, sticky="w", padx=(8, 0))
     action_buttons.append(sync_btn)
+
+    def build_register_tab(tab_register: ttk.Frame) -> None:
+        tab_register.columnconfigure(0, weight=1)
+        tab_register.rowconfigure(6, weight=1)
+
+        register_total_var = tk.StringVar(value="1")
+        register_workers_var = tk.StringVar(value="1")
+        register_output_var = tk.StringVar(value="registered_accounts.txt")
+        register_proxy_var = tk.StringVar()
+        register_mail_provider_var = tk.StringVar(value="tempmail")
+        register_token_dir_var = tk.StringVar(value="codex_tokens")
+        register_group_name_var = tk.StringVar(value="Codex")
+        register_enable_oauth_var = tk.BooleanVar(value=True)
+        register_oauth_required_var = tk.BooleanVar(value=True)
+        register_sync_site_var = tk.BooleanVar(value=True)
+        register_summary_var = tk.StringVar(value="先选择注册机目录，再点击“读取原配置”。")
+        register_config_path_var = tk.StringVar(value="")
+
+        def mask_secret(value: str) -> str:
+            secret = str(value or "").strip()
+            if not secret:
+                return "(空)"
+            if len(secret) <= 10:
+                return "*" * len(secret)
+            return f"{secret[:6]}...{secret[-4:]}"
+
+        def set_register_preview_text(text_widget: ScrolledText, content: str) -> None:
+            text_widget.configure(state="normal")
+            text_widget.delete("1.0", tk.END)
+            text_widget.insert("1.0", content.rstrip() + "\n")
+            text_widget.configure(state="disabled")
+
+        ttk.Label(tab_register, text="注册机", style="Title.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        ttk.Label(
+            tab_register,
+            text="这里不会把 `chatgpt_register.py` 并进主程序；只会读取原项目的 `config.json`，保存必要配置后调用原脚本的 `run_batch()`。",
+            style="Hint.TLabel",
+            justify="left",
+            wraplength=980,
+        ).grid(row=1, column=0, sticky="w", pady=(0, 8))
+
+        path_frame = ttk.LabelFrame(tab_register, text="注册机目录", padding=8)
+        path_frame.grid(row=2, column=0, sticky="ew")
+        path_frame.columnconfigure(1, weight=1)
+        ttk.Label(path_frame, text="项目目录").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=3)
+        ttk.Entry(path_frame, textvariable=register_root_var).grid(row=0, column=1, sticky="ew", pady=3)
+        browse_register_btn = ttk.Button(path_frame, text="选择目录", command=lambda: pick_directory(register_root_var))
+        browse_register_btn.grid(row=0, column=2, sticky="w", padx=(8, 0), pady=3)
+        action_buttons.append(browse_register_btn)
+        ttk.Label(path_frame, textvariable=register_summary_var, style="Hint.TLabel", justify="left", wraplength=920).grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
+
+        runtime_frame = ttk.LabelFrame(tab_register, text="常用运行项", padding=8)
+        runtime_frame.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        for column in range(4):
+            runtime_frame.columnconfigure(column, weight=1 if column in (1, 3) else 0)
+
+        ttk.Label(runtime_frame, text="注册数量").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=3)
+        ttk.Entry(runtime_frame, textvariable=register_total_var).grid(row=0, column=1, sticky="ew", pady=3)
+        ttk.Label(runtime_frame, text="注册并发").grid(row=0, column=2, sticky="w", padx=(8, 6), pady=3)
+        ttk.Entry(runtime_frame, textvariable=register_workers_var).grid(row=0, column=3, sticky="ew", pady=3)
+
+        ttk.Label(runtime_frame, text="输出文件").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=3)
+        ttk.Entry(runtime_frame, textvariable=register_output_var).grid(row=1, column=1, sticky="ew", pady=3)
+        ttk.Label(runtime_frame, text="Token 目录").grid(row=1, column=2, sticky="w", padx=(8, 6), pady=3)
+        ttk.Entry(runtime_frame, textvariable=register_token_dir_var).grid(row=1, column=3, sticky="ew", pady=3)
+
+        ttk.Label(runtime_frame, text="代理").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=3)
+        ttk.Entry(runtime_frame, textvariable=register_proxy_var).grid(row=2, column=1, sticky="ew", pady=3)
+        ttk.Label(runtime_frame, text="邮箱来源").grid(row=2, column=2, sticky="w", padx=(8, 6), pady=3)
+        ttk.Combobox(runtime_frame, textvariable=register_mail_provider_var, values=["tempmail", "mailtm", "tempmail,mailtm", "mailtm,tempmail"]).grid(row=2, column=3, sticky="ew", pady=3)
+
+        ttk.Checkbutton(runtime_frame, text="启用 OAuth", variable=register_enable_oauth_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=3)
+        ttk.Checkbutton(runtime_frame, text="强制要求拿到 OAuth Token", variable=register_oauth_required_var).grid(row=3, column=2, columnspan=2, sticky="w", pady=3)
+
+        sync_frame = ttk.LabelFrame(tab_register, text="上传到当前站点", padding=8)
+        sync_frame.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        sync_frame.columnconfigure(1, weight=1)
+        ttk.Checkbutton(sync_frame, text="运行时自动复用上方网站地址和管理员 API Key", variable=register_sync_site_var).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 4))
+        ttk.Label(sync_frame, text="目标分组").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=3)
+        ttk.Entry(sync_frame, textvariable=register_group_name_var).grid(row=1, column=1, sticky="ew", pady=3)
+        ttk.Label(
+            sync_frame,
+            text="更完整的邮箱域名、Temp-Mail 管理口、重试策略等高级项，仍然保留在原 `chatgpt_register/config.json` 里。",
+            style="Hint.TLabel",
+            justify="left",
+            wraplength=920,
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
+
+        action_frame = ttk.Frame(tab_register)
+        action_frame.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        action_frame.columnconfigure(5, weight=1)
+
+        preview_frame = ttk.LabelFrame(tab_register, text="当前原始配置预览", padding=8)
+        preview_frame.grid(row=6, column=0, sticky="nsew", pady=(8, 0))
+        preview_frame.columnconfigure(0, weight=1)
+        preview_frame.rowconfigure(1, weight=1)
+        ttk.Label(preview_frame, textvariable=register_config_path_var, style="Hint.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        register_preview = ScrolledText(preview_frame, height=12, wrap="word")
+        register_preview.grid(row=1, column=0, sticky="nsew")
+        set_register_preview_text(register_preview, "尚未读取注册机配置。")
+
+        def refresh_register_preview(config: dict[str, Any], register_root: Path) -> None:
+            config_path = register_root / "config.json"
+            register_config_path_var.set(f"配置文件：{config_path}")
+            temp_domains = config.get("temp_mail_domains")
+            if isinstance(temp_domains, list):
+                domains_text = ", ".join(str(item).strip() for item in temp_domains if str(item).strip()) or "(空)"
+            else:
+                domains_text = str(temp_domains or "").strip() or "(空)"
+            preview_lines = [
+                f"register_root: {register_root}",
+                f"mail_provider: {config.get('mail_provider', '')}",
+                f"temp_mail_base_url: {config.get('temp_mail_base_url', '')}",
+                f"temp_mail_domains: {domains_text}",
+                f"mail_tm_base_url: {config.get('mail_tm_base_url', '')}",
+                f"output_file: {config.get('output_file', '')}",
+                f"token_json_dir: {config.get('token_json_dir', '')}",
+                f"enable_oauth: {bool(config.get('enable_oauth'))}",
+                f"oauth_required: {bool(config.get('oauth_required'))}",
+                f"sub2api_base_url: {config.get('sub2api_base_url', '')}",
+                f"sub2api_admin_api_key: {mask_secret(str(config.get('sub2api_admin_api_key') or ''))}",
+                f"sub2api_group_name: {config.get('sub2api_group_name', '')}",
+                f"protocol_trace: {bool(config.get('protocol_trace'))}",
+                f"protocol_trace_dir: {config.get('protocol_trace_dir', '')}",
+            ]
+            set_register_preview_text(register_preview, "\n".join(preview_lines))
+            register_summary_var.set(
+                f"已读取：{register_root} | 邮箱源 {config.get('mail_provider', '') or '-'} | "
+                f"OAuth {'开' if bool(config.get('enable_oauth')) else '关'} | "
+                f"输出 {config.get('output_file', '') or 'registered_accounts.txt'}"
+            )
+
+        def load_register_config_to_form(*, show_message: bool = False, silent: bool = False) -> Path | None:
+            if not register_root_var.get().strip():
+                detected_root = find_default_chatgpt_register_root()
+                if detected_root is not None:
+                    register_root_var.set(str(detected_root))
+            if not register_root_var.get().strip():
+                if silent:
+                    return None
+                raise CLIError("请先选择 chatgpt_register 项目目录")
+            try:
+                register_root = normalize_chatgpt_register_root(register_root_var.get())
+                config = load_chatgpt_register_config(register_root)
+            except ChatGPTRegisterAdapterError as exc:
+                register_summary_var.set(str(exc))
+                register_config_path_var.set("")
+                set_register_preview_text(register_preview, str(exc))
+                if silent:
+                    return None
+                raise CLIError(str(exc)) from exc
+
+            register_root_var.set(str(register_root))
+            register_total_var.set(str(config.get("total_accounts") or "1"))
+            register_workers_var.set(str(config.get("max_workers") or "1"))
+            register_output_var.set(str(config.get("output_file") or "registered_accounts.txt"))
+            register_proxy_var.set(str(config.get("proxy") or ""))
+            register_mail_provider_var.set(str(config.get("mail_provider") or "tempmail"))
+            register_token_dir_var.set(str(config.get("token_json_dir") or "codex_tokens"))
+            register_group_name_var.set(str(config.get("sub2api_group_name") or "Codex"))
+            register_enable_oauth_var.set(bool(config.get("enable_oauth")))
+            register_oauth_required_var.set(bool(config.get("oauth_required")))
+            refresh_register_preview(config, register_root)
+            if show_message:
+                messagebox.showinfo("读取完成", f"已读取：\n{register_root / 'config.json'}")
+            return register_root
+
+        def collect_register_updates() -> tuple[Path, dict[str, Any]]:
+            try:
+                register_root = normalize_chatgpt_register_root(register_root_var.get())
+            except ChatGPTRegisterAdapterError as exc:
+                raise CLIError(str(exc)) from exc
+
+            total_accounts = parse_optional_positive_int(register_total_var.get(), "注册数量") or 1
+            max_workers = parse_optional_positive_int(register_workers_var.get(), "注册并发数") or 1
+            updates = build_common_register_updates(
+                {
+                    "total_accounts": total_accounts,
+                    "max_workers": max_workers,
+                    "output_file": register_output_var.get().strip() or "registered_accounts.txt",
+                    "proxy": register_proxy_var.get().strip(),
+                    "mail_provider": register_mail_provider_var.get().strip() or "tempmail",
+                    "token_json_dir": register_token_dir_var.get().strip() or "codex_tokens",
+                    "sub2api_group_name": register_group_name_var.get().strip() or "Codex",
+                    "enable_oauth": bool(register_enable_oauth_var.get()),
+                    "oauth_required": bool(register_oauth_required_var.get()),
+                }
+            )
+            if register_sync_site_var.get():
+                base_url = non_empty(base_url_var.get())
+                admin_key = non_empty(admin_key_var.get())
+                if base_url:
+                    updates["sub2api_base_url"] = base_url
+                if admin_key:
+                    updates["sub2api_admin_api_key"] = admin_key
+            return register_root, updates
+
+        def save_register_config_action(*, show_message: bool) -> Path:
+            register_root, updates = collect_register_updates()
+            config_path = save_chatgpt_register_config(register_root, updates)
+            latest_config = load_chatgpt_register_config(register_root)
+            refresh_register_preview(latest_config, register_root)
+            if show_message:
+                messagebox.showinfo("保存成功", f"已写入：\n{config_path}")
+            return config_path
+
+        def resolve_register_path(raw_value: str, default_name: str) -> Path:
+            register_root = normalize_chatgpt_register_root(register_root_var.get())
+            target = Path(raw_value.strip() or default_name)
+            if not target.is_absolute():
+                target = register_root / target
+            return target
+
+        def open_register_output_dir() -> None:
+            target = resolve_register_path(register_output_var.get(), "registered_accounts.txt").parent
+            target.mkdir(parents=True, exist_ok=True)
+            open_local_path(target)
+
+        def open_register_token_dir() -> None:
+            target = resolve_register_path(register_token_dir_var.get(), "codex_tokens")
+            target.mkdir(parents=True, exist_ok=True)
+            open_local_path(target)
+
+        def run_register_action(progress_callback: Callable[[int, int, str], None]) -> Any:
+            register_root, updates = collect_register_updates()
+            save_chatgpt_register_config(register_root, updates)
+            try:
+                result = run_chatgpt_register_job(
+                    register_root=register_root,
+                    total_accounts=parse_optional_positive_int(register_total_var.get(), "注册数量") or 1,
+                    max_workers=parse_optional_positive_int(register_workers_var.get(), "注册并发数") or 1,
+                    output_file=register_output_var.get().strip() or "registered_accounts.txt",
+                    proxy=register_proxy_var.get().strip(),
+                    cancel_event=current_cancel_event,
+                    progress_callback=progress_callback,
+                )
+            except ChatGPTRegisterCancelled as exc:
+                raise TaskCancelled(str(exc)) from exc
+            result["config_saved_to"] = str(register_root / "config.json")
+            result["site_sync_enabled"] = bool(register_sync_site_var.get())
+            result["site_base_url"] = base_url_var.get().strip()
+            result["sub2api_group_name"] = register_group_name_var.get().strip() or "Codex"
+            return result
+
+        load_register_btn = ttk.Button(action_frame, text="读取原配置", command=safe_ui_action(lambda: load_register_config_to_form(show_message=True)))
+        load_register_btn.grid(row=0, column=0, sticky="w")
+        action_buttons.append(load_register_btn)
+        save_register_btn = ttk.Button(action_frame, text="保存到原配置", command=safe_ui_action(lambda: save_register_config_action(show_message=True)))
+        save_register_btn.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        action_buttons.append(save_register_btn)
+        run_register_btn = ttk.Button(action_frame, text="开始注册", command=lambda: run_action("注册机", run_register_action, determinate=True))
+        run_register_btn.grid(row=0, column=2, sticky="w", padx=(8, 0))
+        action_buttons.append(run_register_btn)
+        open_config_btn = ttk.Button(action_frame, text="打开 config.json", command=safe_ui_action(lambda: open_local_path(resolve_register_path("config.json", "config.json"))))
+        open_config_btn.grid(row=0, column=3, sticky="w", padx=(8, 0))
+        action_buttons.append(open_config_btn)
+        open_tokens_btn = ttk.Button(action_frame, text="打开 Token 目录", command=safe_ui_action(open_register_token_dir))
+        open_tokens_btn.grid(row=0, column=4, sticky="w", padx=(8, 0))
+        action_buttons.append(open_tokens_btn)
+        open_output_btn = ttk.Button(action_frame, text="打开输出目录", command=safe_ui_action(open_register_output_dir))
+        open_output_btn.grid(row=0, column=5, sticky="w", padx=(8, 0))
+        action_buttons.append(open_output_btn)
+
+        load_register_config_to_form(silent=True)
+
+    tab_register = register_lazy_tab("注册机", build_register_tab, scrollable=False)
 
     # 账号检测
     tab_delete_accounts = add_tab("账号检测", scrollable=False)
