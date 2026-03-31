@@ -22,7 +22,9 @@ class ChatGPTRegisterCancelled(ChatGPTRegisterAdapterError):
 
 COMMON_CONFIG_KEYS = (
     "mail_provider",
+    "blocked_domains",
     "mail_tm_base_url",
+    "mail_tm_domain_index",
     "mail_tm_password",
     "temp_mail_base_url",
     "temp_mail_admin_auth",
