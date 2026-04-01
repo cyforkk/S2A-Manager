@@ -1024,14 +1024,16 @@ def try_convert_auth_snapshot_account(raw: Any, *, source_name: str) -> dict[str
     source_type = non_empty(str(raw.get("type") or ""))
     account_id = non_empty(str(raw.get("account_id") or ""))
     id_token = non_empty(str(raw.get("id_token") or ""))
-    if not access_token or not refresh_token or not email:
+    # 兼容 refresh_token 为空的快照：只要 access_token + email 存在就允许转换。
+    if not access_token or not email:
         return None
 
     credentials: dict[str, Any] = {
         "access_token": access_token,
-        "refresh_token": refresh_token,
         "email": email,
     }
+    if refresh_token:
+        credentials["refresh_token"] = refresh_token
     if id_token:
         credentials["id_token"] = id_token
     if account_id:
@@ -1068,10 +1070,14 @@ def try_convert_auth_snapshot_account(raw: Any, *, source_name: str) -> dict[str
             "accounts": [normalized_account],
         }
     )
+    warnings = [f"{source_name}: 已识别为 auths 单账号快照，自动转换为 openai/oauth 账号"]
+    if not refresh_token:
+        warnings.append(f"{source_name}: refresh_token 为空，已按 access_token 模式继续转换")
+
     return {
         "ok": True,
         "errors": [],
-        "warnings": [f"{source_name}: 已识别为 auths 单账号快照，自动转换为 openai/oauth 账号"],
+        "warnings": warnings,
         "data_payload": standardized,
         "account_count": 1,
         "proxy_count": 0,
