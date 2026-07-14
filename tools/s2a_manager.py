@@ -212,6 +212,10 @@ class ResolvedAuth:
     login: LoginOptions
 
 
+DEFAULT_FIVE_HOUR_THRESHOLD = 99.0
+DEFAULT_SEVEN_DAY_THRESHOLD = 99.0
+
+
 @dataclass
 class GUIConfig:
     base_url: str
@@ -221,6 +225,8 @@ class GUIConfig:
     delete_concurrency: int = DEFAULT_DELETE_CONCURRENCY
     bulk_page_size: int = 100
     bulk_batch_size: int = 100
+    five_hour_threshold: float = DEFAULT_FIVE_HOUR_THRESHOLD
+    seven_day_threshold: float = DEFAULT_SEVEN_DAY_THRESHOLD
     chatgpt_register_root: str = ""
     window_width: int | None = None
     window_height: int | None = None
@@ -278,6 +284,21 @@ def coerce_optional_positive_int(value: Any) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def coerce_optional_nonnegative_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed != parsed:  # NaN
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def format_threshold_value(value: float) -> str:
+    text = f"{float(value):.4f}".rstrip("0").rstrip(".")
+    return text if text else "0"
+
+
 def load_gui_config(*, default_base_url: str, default_admin_api_key: str) -> GUIConfig:
     config = GUIConfig(base_url=default_base_url, admin_api_key=default_admin_api_key)
     path = get_gui_config_path()
@@ -308,6 +329,12 @@ def load_gui_config(*, default_base_url: str, default_admin_api_key: str) -> GUI
     saved_bulk_batch_size = coerce_optional_positive_int(raw.get("bulk_batch_size"))
     if saved_bulk_batch_size is not None:
         config.bulk_batch_size = saved_bulk_batch_size
+    saved_five_hour = coerce_optional_nonnegative_float(raw.get("five_hour_threshold"))
+    if saved_five_hour is not None:
+        config.five_hour_threshold = saved_five_hour
+    saved_seven_day = coerce_optional_nonnegative_float(raw.get("seven_day_threshold"))
+    if saved_seven_day is not None:
+        config.seven_day_threshold = saved_seven_day
     if "chatgpt_register_root" in raw and isinstance(raw.get("chatgpt_register_root"), str):
         config.chatgpt_register_root = raw["chatgpt_register_root"].strip()
     config.window_width = coerce_optional_positive_int(raw.get("window_width"))
@@ -1781,7 +1808,7 @@ def run_admin_gui(
     output_frame.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
     output_frame.columnconfigure(0, weight=1)
     output_frame.rowconfigure(0, weight=1)
-    output = ScrolledText(output_frame, wrap="word", height=6)
+    output = ScrolledText(output_frame, wrap="word", height=3)
     output.grid(row=0, column=0, sticky="nsew")
 
     action_buttons: list[ttk.Button] = []
@@ -2604,39 +2631,83 @@ def run_admin_gui(
             return f"/admin/accounts/{account_id}/usage?source={source}"
         return f"/admin/accounts/{account_id}/usage"
 
-    def bulk_mark_accounts_error(
+    def _coerce_account_id_list(values: Any) -> list[int]:
+        ids: list[int] = []
+        if not isinstance(values, list):
+            return ids
+        for item in values:
+            if isinstance(item, bool):
+                continue
+            if isinstance(item, int) and item > 0:
+                ids.append(item)
+                continue
+            if isinstance(item, float) and item.is_integer() and item > 0:
+                ids.append(int(item))
+                continue
+            if isinstance(item, str) and item.strip().isdigit():
+                number = int(item.strip())
+                if number > 0:
+                    ids.append(number)
+        return unique_ids(ids)
+
+    def bulk_set_accounts_status(
         account_ids: list[int],
+        status: str,
         *,
         progress_callback: Callable[[int, int, str], None],
         client: AdminAPIClient | None = None,
+        progress_label: str | None = None,
+        schedulable: bool | None = None,
     ) -> dict[str, Any]:
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status not in {"active", "inactive", "error"}:
+            raise CLIError("账号状态只支持 active / inactive / error")
         ids = unique_ids([account_id for account_id in account_ids if isinstance(account_id, int) and account_id > 0])
         if not ids:
-            return {"updated_ids": [], "failed": [], "updated_count": 0, "failed_count": 0}
+            return {
+                "updated_ids": [],
+                "failed": [],
+                "updated_count": 0,
+                "failed_count": 0,
+                "status": normalized_status,
+                "schedulable": schedulable,
+            }
 
         request_client = client or get_client()
         updated_ids: list[int] = []
         failed: list[dict[str, Any]] = []
         batch_size = 100
         total_batches = max((len(ids) + batch_size - 1) // batch_size, 1)
+        if schedulable is None:
+            label = progress_label or f"批量设置账号状态为 {normalized_status}"
+        else:
+            sched_text = "开启调度" if schedulable else "关闭调度"
+            label = progress_label or f"批量设置账号为 {normalized_status} 且{sched_text}"
 
         for index in range(0, len(ids), batch_size):
             ensure_not_cancelled()
             batch_ids = ids[index : index + batch_size]
             batch_no = index // batch_size + 1
+            payload: dict[str, Any] = {
+                "account_ids": batch_ids,
+                "status": normalized_status,
+            }
+            # sub2api 调度快照：仅 status=error/disabled 或 schedulable=false 会立即同步。
+            # 管理端 status 实际写入 inactive，仅改 status 时调度开关仍可能保持 true，账号看起来像“没关掉”。
+            if schedulable is not None:
+                payload["schedulable"] = bool(schedulable)
             try:
                 response = request_client.request(
                     "POST",
                     "/admin/accounts/bulk-update",
-                    {
-                        "account_ids": batch_ids,
-                        "status": "error",
-                    },
+                    payload,
                 )
-                success_ids = response.get("success_ids") if isinstance(response, dict) else None
-                if isinstance(success_ids, list):
-                    updated_ids.extend(int(item) for item in success_ids if isinstance(item, int) and item > 0)
-                else:
+                success_ids = _coerce_account_id_list(response.get("success_ids") if isinstance(response, dict) else None)
+                if success_ids:
+                    updated_ids.extend(success_ids)
+                elif isinstance(response, dict) and int(response.get("success") or 0) > 0:
+                    updated_ids.extend(batch_ids)
+                elif not isinstance(response, dict):
                     updated_ids.extend(batch_ids)
                 if isinstance(response, dict):
                     for item in response.get("results") or []:
@@ -2648,6 +2719,10 @@ def run_admin_gui(
                                 "error": str(item.get("error") or "unknown error"),
                             }
                         )
+                    # 若服务端只回了 success 计数、没有 success_ids，避免把整批算成功时掩盖失败明细
+                    if not success_ids and not failed and int(response.get("failed") or 0) > 0:
+                        for account_id in batch_ids:
+                            failed.append({"account_id": account_id, "error": "bulk-update failed without detail"})
             except Exception as exc:
                 error_message = str(exc)
                 for account_id in batch_ids:
@@ -2655,17 +2730,40 @@ def run_admin_gui(
             progress_callback(
                 batch_no,
                 total_batches,
-                f"正在回写鉴权异常状态：批次 {batch_no}/{total_batches}，成功 {len(updated_ids)} 个，失败 {len(failed)} 个",
+                f"{label}：批次 {batch_no}/{total_batches}，成功 {len(updated_ids)} 个，失败 {len(failed)} 个",
             )
 
         updated_ids = unique_ids(updated_ids)
+        failed_ids = {
+            int(item.get("account_id") or 0)
+            for item in failed
+            if isinstance(item.get("account_id"), int) or str(item.get("account_id") or "").isdigit()
+        }
+        updated_ids = [account_id for account_id in updated_ids if account_id not in failed_ids]
         failed.sort(key=lambda item: int(item.get("account_id") or 0))
         return {
             "updated_ids": updated_ids,
             "failed": failed,
             "updated_count": len(updated_ids),
             "failed_count": len(failed),
+            "status": normalized_status,
+            "schedulable": schedulable,
+            "requested_count": len(ids),
         }
+
+    def bulk_mark_accounts_error(
+        account_ids: list[int],
+        *,
+        progress_callback: Callable[[int, int, str], None],
+        client: AdminAPIClient | None = None,
+    ) -> dict[str, Any]:
+        return bulk_set_accounts_status(
+            account_ids,
+            "error",
+            progress_callback=progress_callback,
+            client=client,
+            progress_label="正在回写鉴权异常状态",
+        )
 
     def sync_account_cache_after_detection(
         *,
@@ -2891,11 +2989,11 @@ def run_admin_gui(
         if detected_auth_error_ids or detected_quota_ids:
             sync_prefix = "检测完成"
             if detected_auth_error_ids and detected_quota_ids:
-                sync_prefix = "鉴权异常 / 无额度状态更新完成"
+                sync_prefix = "鉴权异常 / 达阈值状态更新完成"
             elif detected_auth_error_ids:
                 sync_prefix = "鉴权异常状态回写完成"
             elif detected_quota_ids:
-                sync_prefix = "无额度检测完成"
+                sync_prefix = "达阈值检测完成"
             try:
                 synced_accounts_result = retry_detection_operation(
                     lambda: sync_account_cache_after_detection(
@@ -2924,8 +3022,8 @@ def run_admin_gui(
             if account_id in invalid_401_account_ids_cache:
                 issues.append("401/403")
             if account_id in invalid_quota_account_ids_cache:
-                issues.append("无额度")
-            issue_text = " / ".join(issues) if issues else ("401/403" if detect_kind == "auth" else ("无额度" if detect_kind == "quota" else "问题"))
+                issues.append("达阈值")
+            issue_text = " / ".join(issues) if issues else ("401/403" if detect_kind == "auth" else ("达阈值" if detect_kind == "quota" else "问题"))
             label = format_detection_label(account, issue_text)
             labels.append(label)
             if account_id > 0:
@@ -2967,7 +3065,7 @@ def run_admin_gui(
         failed_refreshes: list[dict[str, Any]] = []
         detected_auth_error_ids: list[int] = []
         detected_quota_ids: list[int] = []
-        progress_callback(0, len(target_accounts), f"开始手动刷新状态，共 {len(target_accounts)} 个账号，并发 {refresh_concurrency}")
+        progress_callback(0, len(target_accounts), f"开始再测是否可用，共 {len(target_accounts)} 个账号，并发 {refresh_concurrency}")
 
         def refresh_one(account: dict[str, Any]) -> dict[str, Any]:
             ensure_not_cancelled()
@@ -3050,7 +3148,7 @@ def run_admin_gui(
                     progress_callback(
                         completed,
                         total,
-                        f"手动刷新状态：已完成 {completed}/{total} 个，成功 {refreshed_count} 个，失败 {len(failed_refreshes)} 个",
+                        f"再测是否可用：已完成 {completed}/{total} 个，成功 {refreshed_count} 个，失败 {len(failed_refreshes)} 个",
                     )
             executor.shutdown(wait=False, cancel_futures=True)
 
@@ -3076,7 +3174,7 @@ def run_admin_gui(
             progress_callback(
                 adjusted_current,
                 adjusted_total,
-                f"手动刷新状态完成，正在同步最新账号状态... {message}",
+                f"再测完成，正在同步最新账号状态... {message}",
             )
 
         accounts_result = retry_detection_operation(
@@ -3109,6 +3207,14 @@ def run_admin_gui(
             width = None
         if height is not None and height < 200:
             height = None
+        try:
+            five_hour = parse_optional_float(detect_five_hour_threshold_var.get(), "5小时阈值", min_value=0.0)
+        except Exception:
+            five_hour = None
+        try:
+            seven_day = parse_optional_float(detect_seven_day_threshold_var.get(), "7天阈值", min_value=0.0)
+        except Exception:
+            seven_day = None
         return GUIConfig(
             base_url=base_url_var.get().strip(),
             admin_api_key=admin_key_var.get().strip(),
@@ -3117,6 +3223,8 @@ def run_admin_gui(
             delete_concurrency=clamp_delete_concurrency(parse_optional_positive_int(delete_concurrency_var.get(), "删除并发数") or DEFAULT_DELETE_CONCURRENCY),
             bulk_page_size=clamp_admin_list_page_size(parse_optional_positive_int(page_size_var.get(), "每次读取数量") or 100),
             bulk_batch_size=parse_optional_positive_int(batch_size_var.get(), "每次提交数量") or 100,
+            five_hour_threshold=five_hour if five_hour is not None else DEFAULT_FIVE_HOUR_THRESHOLD,
+            seven_day_threshold=seven_day if seven_day is not None else DEFAULT_SEVEN_DAY_THRESHOLD,
             chatgpt_register_root=register_root_var.get().strip(),
             window_width=width,
             window_height=height,
@@ -3516,6 +3624,7 @@ def run_admin_gui(
     def add_tab(name: str, *, scrollable: bool = True) -> ttk.Frame:
         if not scrollable:
             frame = ttk.Frame(notebook, padding=10)
+            frame.columnconfigure(0, weight=1)
             frame.columnconfigure(1, weight=1)
             notebook.add(frame, text=name)
             notebook_tab_names[str(frame)] = name
@@ -3528,6 +3637,7 @@ def run_admin_gui(
         canvas = tk.Canvas(outer, highlightthickness=0)
         scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
         frame = ttk.Frame(canvas, padding=10)
+        frame.columnconfigure(0, weight=1)
         frame.columnconfigure(1, weight=1)
         window_id = canvas.create_window((0, 0), window=frame, anchor="nw")
         pending_scrollregion = False
@@ -3716,29 +3826,107 @@ def run_admin_gui(
 
     tab_register = register_lazy_tab("注册机", build_register_tab)
 
-    # 账号检测
-    tab_delete_accounts = add_tab("账号检测", scrollable=False)
+    # 账号检测（可滚动，避免底部按钮被窗口裁切）
+    tab_delete_accounts = add_tab("账号检测", scrollable=True)
     tab_delete_accounts.columnconfigure(0, weight=1)
-    tab_delete_accounts.rowconfigure(8, weight=1)
 
     delete_group_var = tk.StringVar(value=GROUP_FILTER_ALL)
-    detect_five_hour_threshold_var = tk.StringVar(value="99")
-    detect_seven_day_threshold_var = tk.StringVar(value="99")
+    detect_five_hour_threshold_var = tk.StringVar(
+        value=format_threshold_value(getattr(saved_config, "five_hour_threshold", DEFAULT_FIVE_HOUR_THRESHOLD))
+    )
+    detect_seven_day_threshold_var = tk.StringVar(
+        value=format_threshold_value(getattr(saved_config, "seven_day_threshold", DEFAULT_SEVEN_DAY_THRESHOLD))
+    )
     detection_usage_source_mode_var = tk.StringVar(value="自动（Anthropic 被动，其它主动）")
     detect_401_count_var = tk.StringVar(value="命中 0")
-    detect_quota_count_var = tk.StringVar(value="命中 0")
-    delete_accounts_summary_var = tk.StringVar(value="401/403: 0   无额度: 0   合计: 0   已选: 0")
+    detect_quota_count_var = tk.StringVar(value="达阈值 0")
+    delete_accounts_summary_var = tk.StringVar(value="401/403: 0   达阈值: 0   合计: 0   列表: 0   已选: 0")
+
+    # 先占位，真正控件在下方创建；列表本体见 row=6
+    delete_accounts_listbox: Any = None
 
     def update_detection_count_widgets() -> None:
         auth_count = len(unique_ids(invalid_401_account_ids_cache))
         quota_count = len(unique_ids(invalid_quota_account_ids_cache))
         total_count = len(unique_ids([*invalid_401_account_ids_cache, *invalid_quota_account_ids_cache]))
-        selected_count = len(delete_accounts_listbox.curselection()) if "delete_accounts_listbox" in locals() else 0
+        list_count = 0
+        selected_count = 0
+        if delete_accounts_listbox is not None:
+            list_count = int(delete_accounts_listbox.size())
+            selected_count = len(delete_accounts_listbox.curselection())
         detect_401_count_var.set(f"命中 {auth_count}")
-        detect_quota_count_var.set(f"命中 {quota_count}")
+        detect_quota_count_var.set(f"达阈值 {quota_count}")
         delete_accounts_summary_var.set(
-            f"401/403: {auth_count}   无额度: {quota_count}   合计: {total_count}   已选: {selected_count}"
+            f"401/403: {auth_count}   达阈值: {quota_count}   合计: {total_count}   "
+            f"列表: {list_count}   已选: {selected_count}"
         )
+
+    def apply_labels_to_account_list(labels: list[str], *, title: str, scope_desc: str = "") -> None:
+        """写入主界面列表，并弹出独立窗口，避免列表被布局挤没时看不到。"""
+        if delete_accounts_listbox is None:
+            raise CLIError("账号列表尚未初始化")
+        set_listbox_items(delete_accounts_listbox, labels)
+        update_detection_count_widgets()
+        preview_lines = labels[:15]
+        more = len(labels) - len(preview_lines)
+        preview_text = "\n".join(preview_lines)
+        if more > 0:
+            preview_text += f"\n... 另外还有 {more} 个账号（完整列表见弹窗与页面底部列表）"
+        status_var.set(f"{title}：共 {len(labels)} 个" + (f"（{scope_desc}）" if scope_desc else ""))
+        try:
+            delete_accounts_listbox.see(0)
+            delete_accounts_listbox.yview_moveto(0)
+            delete_accounts_listbox.selection_clear(0, tk.END)
+            if labels:
+                delete_accounts_listbox.selection_set(0)
+                delete_accounts_listbox.activate(0)
+            # 高亮列表区域，方便定位
+            delete_accounts_listbox.configure(background="#fff8d6")
+            root.after(1200, lambda: delete_accounts_listbox.configure(background="SystemWindow"))
+        except Exception:
+            pass
+        output.delete("1.0", tk.END)
+        output.insert(
+            "1.0",
+            f"{title}\n共 {len(labels)} 个账号"
+            + (f"\n范围：{scope_desc}" if scope_desc else "")
+            + f"\n\n前几项预览：\n{preview_text}\n\n完整列表已弹出独立窗口，也可在本页底部「账号列表」查看。",
+        )
+
+        dialog = tk.Toplevel(root)
+        dialog.title(f"{title}（{len(labels)}）")
+        dialog.geometry("860x520")
+        dialog.minsize(520, 320)
+        try:
+            dialog.transient(root)
+        except Exception:
+            pass
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(1, weight=1)
+        ttk.Label(
+            dialog,
+            text=f"{title}  ·  共 {len(labels)} 个"
+            + (f"  ·  {scope_desc}" if scope_desc else "")
+            + "\n可滚动查看；关闭本窗口不影响主界面列表。",
+            style="Title.TLabel",
+            justify="left",
+        ).grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
+        list_wrap = ttk.Frame(dialog, padding=(12, 0, 12, 8))
+        list_wrap.grid(row=1, column=0, sticky="nsew")
+        list_wrap.columnconfigure(0, weight=1)
+        list_wrap.rowconfigure(0, weight=1)
+        popup_list = tk.Listbox(list_wrap, selectmode=tk.EXTENDED, exportselection=False)
+        popup_scroll = ttk.Scrollbar(list_wrap, orient="vertical", command=popup_list.yview)
+        popup_list.configure(yscrollcommand=popup_scroll.set)
+        popup_list.grid(row=0, column=0, sticky="nsew")
+        popup_scroll.grid(row=0, column=1, sticky="ns")
+        for label in labels:
+            popup_list.insert(tk.END, label)
+        btn_row = ttk.Frame(dialog, padding=(12, 0, 12, 12))
+        btn_row.grid(row=2, column=0, sticky="e")
+        ttk.Button(btn_row, text="关闭窗口", command=dialog.destroy).grid(row=0, column=0, sticky="e")
+        dialog.lift()
+        dialog.focus_force()
 
     def sync_detection_accounts_and_groups(progress_callback: Callable[[int, int, str], None]) -> Any:
         def group_progress(current: int, total: int, message: str) -> None:
@@ -3770,54 +3958,21 @@ def run_admin_gui(
             "accounts": accounts_result.get("account_count", 0),
         }
 
-    detection_scope_frame = ttk.Frame(tab_delete_accounts)
-    detection_scope_frame.grid(row=1, column=0, columnspan=4, sticky="w", pady=3)
-    ttk.Label(detection_scope_frame, text="当前检测分组").grid(row=0, column=0, sticky="w")
-    delete_group_combo = ttk.Combobox(tab_delete_accounts, textvariable=delete_group_var, values=[GROUP_FILTER_ALL], state="readonly", width=38)
-    delete_group_combo.grid(in_=detection_scope_frame, row=0, column=1, sticky="w", padx=(6, 8))
-    group_filter_combos.append(delete_group_combo)
-
     def load_group_accounts_to_delete() -> None:
         if not accounts_cache:
-            raise CLIError("请先点击“同步账号和分组”")
-        group_id = single_group_id_from_label(delete_group_var.get(), allow_all=True)
+            raise CLIError("请先点击“① 同步账号和分组”")
+        scope_text = delete_group_var.get().strip() or GROUP_FILTER_ALL
+        group_id = single_group_id_from_label(scope_text, allow_all=True)
         if group_id is None:
-            labels = [format_account_label(account) for account in accounts_cache]
+            accounts = [account for account in accounts_cache]
+            scope_desc = "全部分组（不限）"
         else:
-            labels = [format_account_label(account) for account in accounts_cache if group_id in get_account_group_ids(account)]
+            accounts = [account for account in accounts_cache if group_id in get_account_group_ids(account)]
+            scope_desc = scope_text
+        labels = [format_account_label(account) for account in accounts]
         if not labels:
-            raise CLIError("当前范围下没有账号")
-        set_listbox_items(delete_accounts_listbox, labels)
-        update_detection_count_widgets()
-
-    delete_sync_accounts_btn = ttk.Button(tab_delete_accounts, text="同步账号和分组", command=lambda: run_action("同步账号和分组", sync_detection_accounts_and_groups, determinate=True))
-    delete_sync_accounts_btn.grid(in_=detection_scope_frame, row=0, column=2, sticky="w")
-    action_buttons.append(delete_sync_accounts_btn)
-    delete_group_load_btn = ttk.Button(tab_delete_accounts, text="载入当前范围账号", command=safe_ui_action(load_group_accounts_to_delete))
-    delete_group_load_btn.grid(in_=detection_scope_frame, row=0, column=3, sticky="w", padx=(8, 0))
-    action_buttons.append(delete_group_load_btn)
-
-    detection_parallel_frame = ttk.Frame(tab_delete_accounts)
-    detection_parallel_frame.grid(row=2, column=0, columnspan=4, sticky="w", pady=3)
-    ttk.Label(detection_parallel_frame, text="检测并发数").grid(row=0, column=0, sticky="w")
-    ttk.Entry(detection_parallel_frame, textvariable=detection_concurrency_var, width=10).grid(row=0, column=1, sticky="w", padx=(6, 20))
-    ttk.Label(detection_parallel_frame, text="删除并发数").grid(row=0, column=2, sticky="w")
-    ttk.Entry(detection_parallel_frame, textvariable=delete_concurrency_var, width=10).grid(row=0, column=3, sticky="w", padx=(6, 0))
-
-    detection_options_frame = ttk.Frame(tab_delete_accounts)
-    detection_options_frame.grid(row=3, column=0, columnspan=4, sticky="w", pady=3)
-    ttk.Label(detection_options_frame, text="用量来源").grid(row=0, column=0, sticky="w")
-    ttk.Combobox(
-        detection_options_frame,
-        textvariable=detection_usage_source_mode_var,
-        values=["自动（Anthropic 被动，其它主动）", "被动采样", "主动查询最新"],
-        state="readonly",
-        width=24,
-    ).grid(row=0, column=1, sticky="w", padx=(6, 12))
-    ttk.Label(detection_options_frame, text="5小时阈值(%)").grid(row=0, column=2, sticky="w")
-    ttk.Entry(detection_options_frame, textvariable=detect_five_hour_threshold_var, width=10).grid(row=0, column=3, sticky="w", padx=(6, 12))
-    ttk.Label(detection_options_frame, text="7天阈值(%)").grid(row=0, column=4, sticky="w")
-    ttk.Entry(detection_options_frame, textvariable=detect_seven_day_threshold_var, width=10).grid(row=0, column=5, sticky="w", padx=(6, 0))
+            raise CLIError(f"当前范围下没有账号：{scope_desc}")
+        apply_labels_to_account_list(labels, title="当前范围全部账号", scope_desc=scope_desc)
 
     def detect_401_accounts_action(progress_callback: Callable[[int, int, str], None]) -> Any:
         return run_usage_detection(
@@ -3830,7 +3985,7 @@ def run_admin_gui(
 
     def detect_quota_accounts_action(progress_callback: Callable[[int, int, str], None]) -> Any:
         return run_usage_detection(
-            title="无额度检测",
+            title="检测达阈值账号",
             detect_kind="quota",
             progress_callback=progress_callback,
             five_hour_threshold=parse_optional_float(detect_five_hour_threshold_var.get(), "5小时阈值", min_value=0.0) or 99.0,
@@ -3851,7 +4006,7 @@ def run_admin_gui(
 
     def load_detected_accounts(account_ids: list[int], issue_label: str) -> None:
         if not account_ids:
-            raise CLIError(f"当前没有检测到{issue_label}账号")
+            raise CLIError(f"当前没有检测到{issue_label}账号，请先执行对应检测")
         labels: list[str] = []
         for account_id in account_ids:
             account = next((item for item in accounts_cache if int(item.get("id") or 0) == account_id), None)
@@ -3862,13 +4017,12 @@ def run_admin_gui(
             labels.append(label)
         if not labels:
             raise CLIError("检测结果对应的账号已失效，请重新同步账号和分组后再检测")
-        set_listbox_items(delete_accounts_listbox, labels)
-        update_detection_count_widgets()
+        apply_labels_to_account_list(labels, title=f"显示{issue_label}账号")
 
     def load_all_detected_accounts() -> None:
         combined_ids = unique_ids([*invalid_401_account_ids_cache, *invalid_quota_account_ids_cache])
         if not combined_ids:
-            raise CLIError("当前没有检测到问题账号")
+            raise CLIError("当前没有检测到问题账号，请先检测")
         labels: list[str] = []
         detection_label_to_account_id.clear()
         for account_id in combined_ids:
@@ -3879,14 +4033,13 @@ def run_admin_gui(
             if account_id in invalid_401_account_ids_cache:
                 issues.append("401/403")
             if account_id in invalid_quota_account_ids_cache:
-                issues.append("无额度")
+                issues.append("达阈值")
             label = format_detection_label(account, " / ".join(issues) if issues else "问题")
             detection_label_to_account_id[label] = account_id
             labels.append(label)
         if not labels:
             raise CLIError("检测结果对应的账号已失效，请重新同步账号和分组后再检测")
-        set_listbox_items(delete_accounts_listbox, labels)
-        update_detection_count_widgets()
+        apply_labels_to_account_list(labels, title="显示全部问题账号")
 
     def delete_accounts_with_progress(
         account_ids: list[int],
@@ -3977,7 +4130,7 @@ def run_admin_gui(
         delete_account_ids_with_confirm(invalid_401_account_ids_cache, "401/403")
 
     def delete_detected_quota_accounts() -> None:
-        delete_account_ids_with_confirm(invalid_quota_account_ids_cache, "无额度")
+        delete_account_ids_with_confirm(invalid_quota_account_ids_cache, "达阈值")
 
     def delete_all_detected_accounts() -> None:
         delete_account_ids_with_confirm(
@@ -3985,78 +4138,117 @@ def run_admin_gui(
             "问题",
         )
 
-    detect_401_btn = ttk.Button(tab_delete_accounts, text="检测 401/403", command=lambda: run_action("检测 401/403", detect_401_accounts_action, determinate=True))
-    detect_401_btn.grid(row=4, column=0, sticky="w", pady=4)
-    action_buttons.append(detect_401_btn)
-    ttk.Label(tab_delete_accounts, textvariable=detect_401_count_var).grid(row=4, column=0, sticky="w", padx=(112, 0), pady=4)
-    detect_quota_btn = ttk.Button(tab_delete_accounts, text="检测无额度", command=lambda: run_action("检测无额度", detect_quota_accounts_action, determinate=True))
-    detect_quota_btn.grid(row=4, column=1, sticky="w", pady=4)
-    action_buttons.append(detect_quota_btn)
-    ttk.Label(tab_delete_accounts, textvariable=detect_quota_count_var).grid(row=4, column=1, sticky="w", padx=(104, 0), pady=4)
-    detect_all_btn = ttk.Button(tab_delete_accounts, text="完整检测", command=lambda: run_action("完整检测", detect_all_accounts_action, determinate=True))
-    detect_all_btn.grid(row=4, column=2, sticky="w", pady=4)
-    action_buttons.append(detect_all_btn)
-    refresh_states_btn = ttk.Button(tab_delete_accounts, text="手动刷新状态", command=lambda: run_action("手动刷新状态", refresh_account_states_action, determinate=True))
-    refresh_states_btn.grid(row=4, column=3, sticky="w", pady=4)
-    action_buttons.append(refresh_states_btn)
-    load_401_btn = ttk.Button(tab_delete_accounts, text="载入 401/403 账号", command=safe_ui_action(lambda: load_detected_accounts(invalid_401_account_ids_cache, "401/403")))
-    load_401_btn.grid(row=5, column=0, sticky="w", pady=4)
-    action_buttons.append(load_401_btn)
-    load_quota_btn = ttk.Button(tab_delete_accounts, text="载入无额度账号", command=safe_ui_action(lambda: load_detected_accounts(invalid_quota_account_ids_cache, "无额度")))
-    load_quota_btn.grid(row=5, column=1, sticky="w", pady=4)
-    action_buttons.append(load_quota_btn)
-    load_all_detected_btn = ttk.Button(tab_delete_accounts, text="载入全部问题账号", command=safe_ui_action(load_all_detected_accounts))
-    load_all_detected_btn.grid(row=5, column=2, sticky="w", pady=4)
-    action_buttons.append(load_all_detected_btn)
-    delete_detected_401_btn = ttk.Button(tab_delete_accounts, text="直接删除 401/403", command=safe_ui_action(delete_detected_401_accounts))
-    delete_detected_401_btn.grid(row=5, column=3, sticky="w", pady=4)
-    action_buttons.append(delete_detected_401_btn)
+    def detection_scope_description() -> str:
+        selected = delete_group_var.get().strip() or GROUP_FILTER_ALL
+        if selected == GROUP_FILTER_ALL:
+            return "当前检测分组：全部账号（不限）"
+        return f"当前检测分组：{selected}"
 
-    delete_detected_quota_btn = ttk.Button(tab_delete_accounts, text="直接删除无额度", command=safe_ui_action(delete_detected_quota_accounts))
-    delete_detected_quota_btn.grid(row=6, column=0, sticky="w", pady=3)
-    action_buttons.append(delete_detected_quota_btn)
-    delete_all_detected_btn = ttk.Button(tab_delete_accounts, text="直接删除全部问题账号", command=safe_ui_action(delete_all_detected_accounts))
-    delete_all_detected_btn.grid(row=6, column=1, sticky="w", pady=3)
-    action_buttons.append(delete_all_detected_btn)
+    def account_ids_in_detection_scope() -> list[int]:
+        """复用账号检测的「当前检测分组」范围，返回该范围内的账号 ID。"""
+        accounts = iter_detection_target_accounts()
+        ids = [int(account.get("id") or 0) for account in accounts if int(account.get("id") or 0) > 0]
+        return unique_ids(ids)
 
-    delete_accounts_list_frame = ttk.Frame(tab_delete_accounts)
-    delete_accounts_list_frame.grid(row=8, column=0, columnspan=4, sticky="nsew", pady=(4, 0))
-    delete_accounts_list_frame.columnconfigure(0, weight=1)
-    delete_accounts_list_frame.rowconfigure(0, weight=1)
-    delete_accounts_listbox = tk.Listbox(delete_accounts_list_frame, selectmode=tk.EXTENDED, exportselection=False, height=10)
-    delete_accounts_listbox.grid(row=0, column=0, sticky="nsew")
-    delete_accounts_scrollbar = ttk.Scrollbar(delete_accounts_list_frame, orient="vertical", command=delete_accounts_listbox.yview)
-    delete_accounts_scrollbar.grid(row=0, column=1, sticky="ns")
-    delete_accounts_listbox.configure(yscrollcommand=delete_accounts_scrollbar.set)
-    delete_accounts_listbox.bind("<<ListboxSelect>>", lambda _event: update_detection_count_widgets())
+    def set_accounts_status_with_progress(
+        account_ids: list[int],
+        status: str,
+        *,
+        progress_callback: Callable[[int, int, str], None],
+        action_label: str,
+        schedulable: bool | None = None,
+    ) -> dict[str, Any]:
+        ids = unique_ids([account_id for account_id in account_ids if isinstance(account_id, int) and account_id > 0])
+        if not ids:
+            raise CLIError(f"当前没有可{action_label}的账号")
 
-    delete_accounts_header_frame = ttk.Frame(tab_delete_accounts)
-    delete_accounts_header_frame.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(8, 2))
-    delete_accounts_header_frame.columnconfigure(1, weight=1)
-    ttk.Label(delete_accounts_header_frame, text="待删除账号列表", style="Title.TLabel").grid(row=0, column=0, sticky="w")
-    ttk.Label(delete_accounts_header_frame, textvariable=delete_accounts_summary_var).grid(row=0, column=1, sticky="w", padx=(12, 0))
-    delete_account_clear_btn = ttk.Button(
-        delete_accounts_header_frame,
-        text="清空列表",
-        command=lambda: (set_listbox_items(delete_accounts_listbox, []), update_detection_count_widgets()),
-    )
-    delete_account_clear_btn.grid(row=0, column=2, sticky="e")
-    action_buttons.append(delete_account_clear_btn)
+        status_result = bulk_set_accounts_status(
+            ids,
+            status,
+            progress_callback=progress_callback,
+            progress_label=f"正在{action_label}",
+            schedulable=schedulable,
+        )
+        if int(status_result.get("updated_count") or 0) <= 0 and int(status_result.get("failed_count") or 0) > 0:
+            raise CLIError(f"{action_label}失败：成功 0 个，失败 {status_result.get('failed_count')} 个")
+        if int(status_result.get("updated_count") or 0) <= 0:
+            raise CLIError(f"{action_label}未生效：服务端未返回成功更新的账号")
+
+        sync_result = sync_account_cache_after_detection(
+            progress_callback=progress_callback,
+            prefix=f"{action_label}完成，正在同步账号状态",
+        )
+        return {
+            **status_result,
+            "scope": detection_scope_description(),
+            "synced_account_count": sync_result.get("account_count"),
+        }
+
+    def close_detected_quota_accounts() -> None:
+        ids = unique_ids(
+            [account_id for account_id in invalid_quota_account_ids_cache if isinstance(account_id, int) and account_id > 0]
+        )
+        if not ids:
+            raise CLIError("当前没有检测到达阈值账号，请先执行「② 检测达阈值」")
+        if not messagebox.askyesno(
+            "确认关闭达阈值账号",
+            f"即将关闭 {len(ids)} 个达阈值账号（inactive + 关闭调度）。\n"
+            f"阈值：5小时 {detect_five_hour_threshold_var.get().strip() or '99'}%、"
+            f"7天 {detect_seven_day_threshold_var.get().strip() or '99'}%。\n是否继续？",
+        ):
+            return
+        run_action(
+            "关闭达阈值账号",
+            lambda progress: set_accounts_status_with_progress(
+                ids,
+                "inactive",
+                progress_callback=progress,
+                action_label="关闭达阈值账号",
+                schedulable=False,
+            ),
+            determinate=True,
+        )
+
+    def set_detection_scope_accounts_status(status: str, *, action_label: str) -> None:
+        ids = account_ids_in_detection_scope()
+        if not ids:
+            raise CLIError(f"{detection_scope_description()} 下没有可{action_label}的账号，请先同步")
+        scope_text = detection_scope_description()
+        enable = status == "active"
+        status_text = "开启（active + 可调度）" if enable else "关闭（inactive + 不可调度）"
+        if not messagebox.askyesno(
+            f"确认{action_label}",
+            f"{scope_text}\n即将把该范围内的 {len(ids)} 个账号设为 {status_text}。\n是否继续？",
+        ):
+            return
+        run_action(
+            action_label,
+            lambda progress: set_accounts_status_with_progress(
+                ids,
+                status,
+                progress_callback=progress,
+                action_label=action_label,
+                schedulable=enable,
+            ),
+            determinate=True,
+        )
 
     def run_delete_accounts_selected() -> None:
+        if delete_accounts_listbox is None:
+            raise CLIError("账号列表尚未初始化")
         labels = listbox_items(delete_accounts_listbox)
         if not labels:
-            raise CLIError("请先选择账号")
+            raise CLIError("列表为空。请先「显示」账号，或执行检测后再显示结果")
         ids: list[int] = []
         for label in labels:
             account_id = account_label_to_id.get(label)
             if account_id is None:
                 account_id = detection_label_to_account_id.get(label)
             if account_id is None:
-                raise CLIError("待删除列表中存在过期项，请重新载入")
+                raise CLIError("列表项已过期，请重新同步并显示")
             ids.append(account_id)
         ids = unique_ids(ids)
-        if not messagebox.askyesno("确认删除", f"即将删除 {len(ids)} 个账号，此操作不可撤销。\n是否继续？"):
+        if not messagebox.askyesno("确认删除", f"即将删除列表中的 {len(ids)} 个账号，不可撤销。\n是否继续？"):
             return
         run_action(
             "删除账号",
@@ -4064,9 +4256,186 @@ def run_admin_gui(
             determinate=True,
         )
 
-    delete_accounts_btn = ttk.Button(tab_delete_accounts, text="删除当前列表中的账号", command=safe_ui_action(run_delete_accounts_selected))
-    delete_accounts_btn.grid(row=9, column=0, sticky="w", pady=8)
+    # ---------- 界面：按 ①准备 → ②检测 → ③处理 → ④列表 分区 ----------
+    ttk.Label(
+        tab_delete_accounts,
+        text="推荐流程：① 同步并选分组 → ② 设阈值并检测 → ③ 显示结果后关闭/删除 → 下方列表可核对（本页可滚动）",
+        style="Hint.TLabel",
+        justify="left",
+        wraplength=1000,
+    ).grid(row=0, column=0, sticky="ew", pady=(0, 4))
+
+    # ① 准备
+    step1 = ttk.LabelFrame(tab_delete_accounts, text="① 准备（先做这一步）", padding=6)
+    step1.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+    step1.columnconfigure(1, weight=1)
+    ttk.Label(step1, text="检测分组").grid(row=0, column=0, sticky="w")
+    delete_group_combo = ttk.Combobox(step1, textvariable=delete_group_var, values=[GROUP_FILTER_ALL], state="readonly", width=42)
+    delete_group_combo.grid(row=0, column=1, sticky="ew", padx=(6, 8))
+    group_filter_combos.append(delete_group_combo)
+    delete_sync_accounts_btn = ttk.Button(
+        step1,
+        text="同步账号和分组",
+        command=lambda: run_action("同步账号和分组", sync_detection_accounts_and_groups, determinate=True),
+    )
+    delete_sync_accounts_btn.grid(row=0, column=2, sticky="w")
+    action_buttons.append(delete_sync_accounts_btn)
+    delete_group_load_btn = ttk.Button(step1, text="预览本分组全部账号", command=safe_ui_action(load_group_accounts_to_delete))
+    delete_group_load_btn.grid(row=0, column=3, sticky="w", padx=(8, 0))
+    action_buttons.append(delete_group_load_btn)
+
+    opt_row = ttk.Frame(step1)
+    opt_row.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+    ttk.Label(opt_row, text="5小时阈值%").grid(row=0, column=0, sticky="w")
+    ttk.Entry(opt_row, textvariable=detect_five_hour_threshold_var, width=8).grid(row=0, column=1, sticky="w", padx=(4, 12))
+    ttk.Label(opt_row, text="7天阈值%").grid(row=0, column=2, sticky="w")
+    ttk.Entry(opt_row, textvariable=detect_seven_day_threshold_var, width=8).grid(row=0, column=3, sticky="w", padx=(4, 12))
+    ttk.Label(opt_row, text="用量来源").grid(row=0, column=4, sticky="w")
+    ttk.Combobox(
+        opt_row,
+        textvariable=detection_usage_source_mode_var,
+        values=["自动（Anthropic 被动，其它主动）", "被动采样", "主动查询最新"],
+        state="readonly",
+        width=22,
+    ).grid(row=0, column=5, sticky="w", padx=(4, 12))
+    ttk.Label(opt_row, text="检测并发").grid(row=0, column=6, sticky="w")
+    ttk.Entry(opt_row, textvariable=detection_concurrency_var, width=6).grid(row=0, column=7, sticky="w", padx=(4, 12))
+    ttk.Label(opt_row, text="删除并发").grid(row=0, column=8, sticky="w")
+    ttk.Entry(opt_row, textvariable=delete_concurrency_var, width=6).grid(row=0, column=9, sticky="w", padx=(4, 0))
+
+    # ② 检测
+    step2 = ttk.LabelFrame(tab_delete_accounts, text="② 检测（找出问题账号）", padding=6)
+    step2.grid(row=2, column=0, sticky="ew", pady=(0, 4))
+    detect_quota_btn = ttk.Button(
+        step2,
+        text="检测达阈值",
+        command=lambda: run_action("检测达阈值账号", detect_quota_accounts_action, determinate=True),
+    )
+    detect_quota_btn.grid(row=0, column=0, sticky="w")
+    action_buttons.append(detect_quota_btn)
+    ttk.Label(step2, textvariable=detect_quota_count_var).grid(row=0, column=1, sticky="w", padx=(6, 16))
+    detect_401_btn = ttk.Button(
+        step2,
+        text="检测 401/403",
+        command=lambda: run_action("检测 401/403", detect_401_accounts_action, determinate=True),
+    )
+    detect_401_btn.grid(row=0, column=2, sticky="w")
+    action_buttons.append(detect_401_btn)
+    ttk.Label(step2, textvariable=detect_401_count_var).grid(row=0, column=3, sticky="w", padx=(6, 16))
+    detect_all_btn = ttk.Button(
+        step2,
+        text="完整检测（两者都查）",
+        command=lambda: run_action("完整检测", detect_all_accounts_action, determinate=True),
+    )
+    detect_all_btn.grid(row=0, column=4, sticky="w", padx=(0, 12))
+    action_buttons.append(detect_all_btn)
+    refresh_states_btn = ttk.Button(
+        step2,
+        text="再测是否可用",
+        command=lambda: run_action("再测是否可用", refresh_account_states_action, determinate=True),
+    )
+    refresh_states_btn.grid(row=0, column=5, sticky="w")
+    action_buttons.append(refresh_states_btn)
+    ttk.Label(
+        step2,
+        text="检测/再测都只记录结果，不会自动删或关；下一步在③里处理。",
+        style="Hint.TLabel",
+    ).grid(row=1, column=0, columnspan=6, sticky="w", pady=(4, 0))
+
+    # ③ 处理结果（按钮尽量集中在上方，避免被窗口底栏裁切）
+    step3 = ttk.LabelFrame(tab_delete_accounts, text="③ 处理检测结果（先显示再操作）", padding=6)
+    step3.grid(row=3, column=0, sticky="ew", pady=(0, 4))
+
+    ttk.Label(step3, text="达阈值：").grid(row=0, column=0, sticky="w")
+    load_quota_btn = ttk.Button(
+        step3,
+        text="显示",
+        command=safe_ui_action(lambda: load_detected_accounts(invalid_quota_account_ids_cache, "达阈值")),
+    )
+    load_quota_btn.grid(row=0, column=1, sticky="w", padx=(0, 4))
+    action_buttons.append(load_quota_btn)
+    close_quota_btn = ttk.Button(step3, text="关闭账号", command=safe_ui_action(close_detected_quota_accounts))
+    close_quota_btn.grid(row=0, column=2, sticky="w", padx=(0, 4))
+    action_buttons.append(close_quota_btn)
+    delete_detected_quota_btn = ttk.Button(step3, text="删除", command=safe_ui_action(delete_detected_quota_accounts))
+    delete_detected_quota_btn.grid(row=0, column=3, sticky="w", padx=(0, 12))
+    action_buttons.append(delete_detected_quota_btn)
+
+    ttk.Label(step3, text="401/403：").grid(row=0, column=4, sticky="w")
+    load_401_btn = ttk.Button(
+        step3,
+        text="显示",
+        command=safe_ui_action(lambda: load_detected_accounts(invalid_401_account_ids_cache, "401/403")),
+    )
+    load_401_btn.grid(row=0, column=5, sticky="w", padx=(0, 4))
+    action_buttons.append(load_401_btn)
+    delete_detected_401_btn = ttk.Button(step3, text="删除", command=safe_ui_action(delete_detected_401_accounts))
+    delete_detected_401_btn.grid(row=0, column=6, sticky="w", padx=(0, 12))
+    action_buttons.append(delete_detected_401_btn)
+
+    ttk.Label(step3, text="全部问题：").grid(row=0, column=7, sticky="w")
+    load_all_detected_btn = ttk.Button(step3, text="显示", command=safe_ui_action(load_all_detected_accounts))
+    load_all_detected_btn.grid(row=0, column=8, sticky="w", padx=(0, 4))
+    action_buttons.append(load_all_detected_btn)
+    delete_all_detected_btn = ttk.Button(step3, text="删除", command=safe_ui_action(delete_all_detected_accounts))
+    delete_all_detected_btn.grid(row=0, column=9, sticky="w", padx=(0, 12))
+    action_buttons.append(delete_all_detected_btn)
+
+    disable_all_scope_btn = ttk.Button(
+        step3,
+        text="本分组全部关闭",
+        command=safe_ui_action(lambda: set_detection_scope_accounts_status("inactive", action_label="全部关闭")),
+    )
+    disable_all_scope_btn.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+    action_buttons.append(disable_all_scope_btn)
+    enable_all_scope_btn = ttk.Button(
+        step3,
+        text="本分组全部开启",
+        command=safe_ui_action(lambda: set_detection_scope_accounts_status("active", action_label="全部开启")),
+    )
+    enable_all_scope_btn.grid(row=1, column=2, columnspan=2, sticky="w", padx=(8, 0), pady=(6, 0))
+    action_buttons.append(enable_all_scope_btn)
+    ttk.Label(
+        step3,
+        text="关闭=停用并禁调度；开启=启用并可调度。列表操作见下方。",
+        style="Hint.TLabel",
+    ).grid(row=1, column=4, columnspan=6, sticky="w", padx=(8, 0), pady=(6, 0))
+
+    # ④ 列表（固定高度 + 本页可滚动，保证工具栏按钮始终可滚到）
+    step4 = ttk.LabelFrame(tab_delete_accounts, text="④ 账号列表（结果在此，并会弹窗）", padding=6)
+    step4.grid(row=4, column=0, sticky="ew", pady=(0, 8))
+    step4.columnconfigure(0, weight=1)
+
+    list_toolbar = ttk.Frame(step4)
+    list_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+    list_toolbar.columnconfigure(1, weight=1)
+    ttk.Label(list_toolbar, textvariable=delete_accounts_summary_var).grid(row=0, column=0, sticky="w")
+    delete_account_clear_btn = ttk.Button(
+        list_toolbar,
+        text="清空列表",
+        command=lambda: (set_listbox_items(delete_accounts_listbox, []), update_detection_count_widgets()),
+    )
+    delete_account_clear_btn.grid(row=0, column=2, sticky="e", padx=(8, 0))
+    action_buttons.append(delete_account_clear_btn)
+    delete_accounts_btn = ttk.Button(list_toolbar, text="删除列表中的账号", command=safe_ui_action(run_delete_accounts_selected))
+    delete_accounts_btn.grid(row=0, column=3, sticky="e", padx=(8, 0))
     action_buttons.append(delete_accounts_btn)
+
+    list_body = ttk.Frame(step4)
+    list_body.grid(row=1, column=0, sticky="ew")
+    list_body.columnconfigure(0, weight=1)
+    delete_accounts_listbox = tk.Listbox(
+        list_body,
+        selectmode=tk.EXTENDED,
+        exportselection=False,
+        height=10,
+        activestyle="dotbox",
+    )
+    delete_accounts_listbox.grid(row=0, column=0, sticky="ew")
+    delete_accounts_scrollbar = ttk.Scrollbar(list_body, orient="vertical", command=delete_accounts_listbox.yview)
+    delete_accounts_scrollbar.grid(row=0, column=1, sticky="ns")
+    delete_accounts_listbox.configure(yscrollcommand=delete_accounts_scrollbar.set)
+    delete_accounts_listbox.bind("<<ListboxSelect>>", lambda _event: update_detection_count_widgets())
     update_detection_count_widgets()
 
     # 删除代理

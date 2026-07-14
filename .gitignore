@@ -1,10 +1,16 @@
 __pycache__/
 *.pyc
+*.pyo
 build/
 dist/
 *.spec.bak
 .venv/
+.python-version.bak
 .idea/
 .vscode/
+*.egg-info/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
 release.ps1
 release/

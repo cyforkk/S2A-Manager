@@ -1,0 +1,20 @@
+[project]
+name = "s2a-manager"
+version = "0.2.2"
+description = "面向 sub2api 管理接口的 Windows 可视化管理工具（Python + Tkinter）"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/GALIAIS/S2A-Manager"
+Releases = "https://github.com/GALIAIS/S2A-Manager/releases"
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.0",
+]
+
+[tool.uv]
+# 应用型仓库：不打包安装为库，仅用 uv 管理解释器与依赖
+package = false

@@ -37,16 +37,16 @@ jobs:
           fetch-depth: 0
           ref: ${{ steps.release_ref.outputs.checkout_ref }}
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
+          enable-cache: true
 
       - name: Install Build Dependencies
         shell: pwsh
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install pyinstaller
+          uv sync --group dev --frozen
 
       - name: Normalize PyInstaller Spec For CI
         shell: pwsh
@@ -118,7 +118,7 @@ jobs:
       - name: Build EXE
         shell: pwsh
         run: |
-          python -m PyInstaller S2A-Manager.spec --noconfirm
+          uv run pyinstaller S2A-Manager.spec --noconfirm
 
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
