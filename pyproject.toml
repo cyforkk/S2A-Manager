@@ -1,14 +1,14 @@
 [project]
 name = "s2a-manager"
-version = "0.2.2"
-description = "面向 sub2api 管理接口的 Windows 可视化管理工具（Python + Tkinter）"
+version = "0.2.3"
+description = "面向 sub2api 管理接口的跨平台可视化管理工具（Python + Tkinter）"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []
 
 [project.urls]
-Repository = "https://github.com/GALIAIS/S2A-Manager"
-Releases = "https://github.com/GALIAIS/S2A-Manager/releases"
+Repository = "https://github.com/cyforkk/S2A-Manager"
+Releases = "https://github.com/cyforkk/S2A-Manager/releases"
 
 [dependency-groups]
 dev = [
