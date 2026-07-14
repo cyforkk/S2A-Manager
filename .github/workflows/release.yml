@@ -48,19 +48,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 固定 runner 镜像，避免 latest 漂移（macos-latest 将于 2026-06 切到 macOS 26）
+          # 固定 runner 镜像；mac Intel 不再用 macos-13（排队极慢/容量不足），改在 macos-15 交叉出 x86_64
           - os: windows-2022
             asset_name: S2A-Manager-windows-x64.exe
             built_name: S2A-Manager.exe
+            target_arch: ""
           - os: macos-15
             asset_name: S2A-Manager-macos-arm64
             built_name: S2A-Manager
-          - os: macos-13
+            target_arch: arm64
+          - os: macos-15
             asset_name: S2A-Manager-macos-x64
             built_name: S2A-Manager
+            target_arch: x86_64
           - os: ubuntu-24.04
             asset_name: S2A-Manager-linux-x64
             built_name: S2A-Manager
+            target_arch: ""
 
     runs-on: ${{ matrix.os }}
 
@@ -115,7 +119,17 @@ jobs:
 
       - name: Build with PyInstaller
         shell: bash
+        env:
+          PYINSTALLER_TARGET_ARCH: ${{ matrix.target_arch }}
         run: |
+          set -euo pipefail
+          if [ -n "${PYINSTALLER_TARGET_ARCH}" ]; then
+            echo "Building with PYINSTALLER_TARGET_ARCH=${PYINSTALLER_TARGET_ARCH}"
+          fi
+          # macOS x86_64 在 arm64 runner 上依赖 Rosetta
+          if [ "${{ runner.os }}" = "macOS" ] && [ "${PYINSTALLER_TARGET_ARCH}" = "x86_64" ]; then
+            softwareupdate --install-rosetta --agree-to-license || true
+          fi
           uv run pyinstaller S2A-Manager.spec --noconfirm
           if [ ! -f "dist/${{ matrix.built_name }}" ]; then
             echo "Build output missing: dist/${{ matrix.built_name }}"
@@ -127,6 +141,10 @@ jobs:
             mv "dist/${{ matrix.built_name }}" "dist/${{ matrix.asset_name }}"
           fi
           chmod +x "dist/${{ matrix.asset_name }}" || true
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            file "dist/${{ matrix.asset_name }}" || true
+            lipo -info "dist/${{ matrix.asset_name }}" 2>/dev/null || true
+          fi
           ls -la dist
 
       - name: Upload build artifact

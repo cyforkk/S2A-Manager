@@ -54,6 +54,11 @@ pyz = PYZ(a.pure)
 
 # Windows 无控制台；macOS/Linux 同样窗口应用
 # UPX 在部分 macOS/Linux 环境不稳定，默认关闭以保证 CI 成功率
+# macOS 可用环境变量 PYINSTALLER_TARGET_ARCH=x86_64|arm64|universal2
+# 在 arm64 runner 上构建 x86_64（依赖 Rosetta），避免使用已难排队的 macos-13
+_raw_arch = (os.environ.get("PYINSTALLER_TARGET_ARCH") or "").strip() or None
+TARGET_ARCH = _raw_arch if _raw_arch in {"x86_64", "arm64", "universal2"} else None
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -70,7 +75,7 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
-    target_arch=None,
+    target_arch=TARGET_ARCH,
     codesign_identity=None,
     entitlements_file=None,
 )
