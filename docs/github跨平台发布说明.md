@@ -8,12 +8,12 @@
 
 ## 产物
 
-| 平台 | 产物文件名 |
-|------|------------|
-| Windows x64 | `S2A-Manager-windows-x64.exe` |
-| macOS arm64 | `S2A-Manager-macos-arm64` |
-| macOS x64 | `S2A-Manager-macos-x64` |
-| Linux x64 | `S2A-Manager-linux-x64` |
+| 平台 | Runner | 产物文件名 |
+|------|--------|------------|
+| Windows x64 | `windows-2022` | `S2A-Manager-windows-x64.exe` |
+| macOS arm64 | `macos-15`（不使用 `macos-latest`，避免 2026-06 切到 macOS 26） | `S2A-Manager-macos-arm64` |
+| macOS x64 | `macos-13` | `S2A-Manager-macos-x64` |
+| Linux x64 | `ubuntu-24.04` | `S2A-Manager-linux-x64` |
 
 构建工具：PyInstaller + uv（dev 依赖组）。
 

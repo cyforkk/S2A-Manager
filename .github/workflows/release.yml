@@ -48,10 +48,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
+          # 固定 runner 镜像，避免 latest 漂移（macos-latest 将于 2026-06 切到 macOS 26）
+          - os: windows-2022
             asset_name: S2A-Manager-windows-x64.exe
             built_name: S2A-Manager.exe
-          - os: macos-latest
+          - os: macos-15
             asset_name: S2A-Manager-macos-arm64
             built_name: S2A-Manager
           - os: macos-13
