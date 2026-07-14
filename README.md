@@ -96,11 +96,34 @@ uv run pyinstaller S2A-Manager.spec --noconfirm
 
 输出：`dist\S2A-Manager.exe`
 
-## 版本与发布
+## 版本与跨平台发布
 
-- 版本号：根目录 `VERSION`（如 `v0.2.2`）
-- `pyproject.toml` 中 `version` 应与之对应（去掉 `v` 前缀）
-- 推送 `v*` tag 时，GitHub Actions 在 Windows 上构建 EXE 并发布 Release（tag 必须与 `VERSION` 一致）
+遵循 [skill-github-release](https://github.com/cyforkk/skill-github-release)：推送版本标签后，GitHub Actions **矩阵构建** 多平台可执行包并上传到 Release。
+
+- 版本号：根目录 `VERSION`（如 `v0.2.2`），**须与 tag 完全一致**
+- `pyproject.toml` 的 `version` 建议与之对应（去掉 `v` 前缀）
+
+### Release 产物
+
+| 平台 | 文件 |
+|------|------|
+| Windows x64 | `S2A-Manager-windows-x64.exe` |
+| macOS Apple Silicon | `S2A-Manager-macos-arm64` |
+| macOS Intel | `S2A-Manager-macos-x64` |
+| Linux x64 | `S2A-Manager-linux-x64` |
+
+### 发布命令示例
+
+```bash
+# 修改 VERSION 与 pyproject.toml 后提交
+git tag v0.2.2
+git push origin v0.2.2
+gh run list --workflow=Release
+```
+
+仓库需开启 Actions 写权限：Settings → Actions → General → Workflow permissions → **Read and write**。
+
+详见：`docs/github跨平台发布说明.md`
 
 ## 环境变量（可选）
 

@@ -1,13 +1,19 @@
+# 跨平台发布流水线（遵循 skill-github-release）
+# 触发：推送 v* 标签 / 发布 Release / 手动指定 tag
+# 产物：Windows .exe、macOS arm64/x64、Linux x64
+
 name: Release
 
 on:
   push:
     tags:
       - "v*"
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       tag:
-        description: "要发布的现有 tag，例如 v0.2.0"
+        description: "要发布的现有 tag，例如 v0.2.2"
         required: true
         type: string
 
@@ -15,129 +21,183 @@ permissions:
   contents: write
 
 jobs:
-  build-and-release:
-    runs-on: windows-latest
-
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      checkout_ref: ${{ steps.release_ref.outputs.checkout_ref }}
+      release_tag: ${{ steps.release_ref.outputs.release_tag }}
     steps:
       - name: Resolve Release Tag
         id: release_ref
-        shell: pwsh
+        shell: bash
         run: |
-          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
-            "checkout_ref=${{ inputs.tag }}" >> $env:GITHUB_OUTPUT
-            "release_tag=${{ inputs.tag }}" >> $env:GITHUB_OUTPUT
-          } else {
-            "checkout_ref=${{ github.ref }}" >> $env:GITHUB_OUTPUT
-            "release_tag=${{ github.ref_name }}" >> $env:GITHUB_OUTPUT
-          }
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "checkout_ref=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+            echo "release_tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "release" ]; then
+            echo "checkout_ref=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+            echo "release_tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "checkout_ref=${{ github.ref }}" >> "$GITHUB_OUTPUT"
+            echo "release_tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
 
+  build:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset_name: S2A-Manager-windows-x64.exe
+            built_name: S2A-Manager.exe
+          - os: macos-latest
+            asset_name: S2A-Manager-macos-arm64
+            built_name: S2A-Manager
+          - os: macos-13
+            asset_name: S2A-Manager-macos-x64
+            built_name: S2A-Manager
+          - os: ubuntu-24.04
+            asset_name: S2A-Manager-linux-x64
+            built_name: S2A-Manager
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ steps.release_ref.outputs.checkout_ref }}
+          ref: ${{ needs.resolve.outputs.checkout_ref }}
+
+      - name: Verify Tag Matches VERSION
+        shell: bash
+        run: |
+          tag="${{ needs.resolve.outputs.release_tag }}"
+          version="$(tr -d '[:space:]' < VERSION)"
+          if [ "$tag" != "$version" ]; then
+            echo "Tag '$tag' does not match VERSION '$version'."
+            exit 1
+          fi
+
+      - name: Install Linux Tk dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3-tk \
+            python3-dev \
+            tcl \
+            tk \
+            libtcl8.6 \
+            libtk8.6 \
+            binutils
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v6
         with:
-          python-version: "3.12"
           enable-cache: true
 
-      - name: Install Build Dependencies
-        shell: pwsh
+      - name: Create venv and install build deps
+        shell: bash
         run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            # 优先系统 Python（带 tkinter），避免托管解释器缺 _tkinter
+            uv venv --python python3 .venv
+          else
+            uv venv --python 3.12 .venv
+          fi
+          export UV_PROJECT_ENVIRONMENT="${PWD}/.venv"
           uv sync --group dev --frozen
+          uv run python -c "import sys; print(sys.version); import tkinter; print('tkinter', tkinter.TkVersion)"
 
-      - name: Normalize PyInstaller Spec For CI
-        shell: pwsh
-        run: |
-          @'
-          # -*- mode: python ; coding: utf-8 -*-
-          
-          import os
-          from pathlib import Path
-          import sys
-          
-          PYTHON_ROOT = Path(os.environ.get("PYINSTALLER_PYTHON_ROOT") or sys.base_prefix)
-          if not (PYTHON_ROOT / "tcl").exists():
-              PYTHON_ROOT = Path(sys.executable).resolve().parent
-          
-          tk_datas = [
-              (str(PYTHON_ROOT / "tcl" / "tcl8.6"), "_tcl_data"),
-              (str(PYTHON_ROOT / "tcl" / "tk8.6"), "_tk_data"),
-              (str(PYTHON_ROOT / "tcl" / "tcl8"), "tcl8"),
-              ("VERSION", "."),
-          ]
-          
-          a = Analysis(
-              ['tools\\s2a_manager.py'],
-              pathex=[],
-              binaries=[],
-              datas=tk_datas,
-              hiddenimports=['tkinter', 'tkinter.ttk', 'tkinter.filedialog', 'tkinter.messagebox', '_tkinter'],
-              hookspath=['pyinstaller_hooks'],
-              hooksconfig={},
-              runtime_hooks=[],
-              excludes=[],
-              noarchive=False,
-              optimize=0,
-          )
-          pyz = PYZ(a.pure)
-          
-          exe = EXE(
-              pyz,
-              a.scripts,
-              a.binaries,
-              a.datas,
-              [],
-              name='S2A-Manager',
-              debug=False,
-              bootloader_ignore_signals=False,
-              strip=False,
-              upx=True,
-              upx_exclude=[],
-              runtime_tmpdir=None,
-              console=False,
-              disable_windowed_traceback=False,
-              argv_emulation=False,
-              target_arch=None,
-              codesign_identity=None,
-              entitlements_file=None,
-          )
-          '@ | Set-Content -Path S2A-Manager.spec -Encoding UTF8
-
-      - name: Verify Tag Matches VERSION
-        shell: pwsh
-        run: |
-          $tag = "${{ steps.release_ref.outputs.release_tag }}"
-          $version = (Get-Content VERSION -Raw).Trim()
-          if ($tag -ne $version) {
-            throw "Tag '$tag' does not match VERSION '$version'."
-          }
-
-      - name: Build EXE
-        shell: pwsh
+      - name: Build with PyInstaller
+        shell: bash
         run: |
           uv run pyinstaller S2A-Manager.spec --noconfirm
+          if [ ! -f "dist/${{ matrix.built_name }}" ]; then
+            echo "Build output missing: dist/${{ matrix.built_name }}"
+            ls -la dist || true
+            exit 1
+          fi
+          # 统一为带平台后缀的产物名
+          if [ "${{ matrix.built_name }}" != "${{ matrix.asset_name }}" ]; then
+            mv "dist/${{ matrix.built_name }}" "dist/${{ matrix.asset_name }}"
+          fi
+          chmod +x "dist/${{ matrix.asset_name }}" || true
+          ls -la dist
 
-      - name: Upload Build Artifact
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: S2A-Manager-${{ steps.release_ref.outputs.release_tag }}
-          path: dist/S2A-Manager.exe
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}
           if-no-files-found: error
 
+  publish:
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.checkout_ref }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Flatten assets
+        shell: bash
+        run: |
+          mkdir -p dist
+          find release-assets -type f -print
+          find release-assets -type f -exec cp -v {} dist/ \;
+          ls -la dist
+
       - name: Publish GitHub Release
-        shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
-          $tag = "${{ steps.release_ref.outputs.release_tag }}"
-          $asset = "dist/S2A-Manager.exe"
+          set -euo pipefail
+          tag="${{ needs.resolve.outputs.release_tag }}"
+          mapfile -t files < <(find dist -type f | sort)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No release assets found"
+            exit 1
+          fi
 
-          gh release view $tag --json tagName -q .tagName *> $null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $asset --clobber
-          } else {
-            gh release create $tag $asset --title "S2A Manager $tag" --generate-notes
-          }
+          notes="$(cat <<'EOF'
+          ## S2A Manager ${TAG}
+
+          跨平台可执行包（PyInstaller 单文件）。
+
+          ### 下载
+
+          | 平台 | 文件 |
+          |------|------|
+          | Windows x64 | `S2A-Manager-windows-x64.exe` |
+          | macOS Apple Silicon | `S2A-Manager-macos-arm64` |
+          | macOS Intel | `S2A-Manager-macos-x64` |
+          | Linux x64 | `S2A-Manager-linux-x64` |
+
+          ### 说明
+
+          - 首次运行前请配置网站地址与管理员 API Key
+          - macOS / Linux 若无法直接打开，请先 `chmod +x` 后执行
+          - macOS 可能提示未签名：系统设置 → 隐私与安全性 → 仍要打开
+
+          EOF
+          )"
+          notes="${notes//\$\{TAG\}/$tag}"
+
+          if gh release view "$tag" --json tagName -q .tagName >/dev/null 2>&1; then
+            gh release upload "$tag" "${files[@]}" --clobber
+          else
+            gh release create "$tag" "${files[@]}" \
+              --title "S2A Manager $tag" \
+              --notes "$notes"
+          fi
